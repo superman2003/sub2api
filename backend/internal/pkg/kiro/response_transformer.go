@@ -232,7 +232,11 @@ type AnthropicSSEEncoder struct {
 }
 
 // NewAnthropicSSEEncoder builds an encoder. The flusher is called after each
-// event so clients receive chunks in real time.
+// event so clients receive chunks in real time. inputTokensHint is an
+// optional pre-computed estimate of the prompt token count; when > 0 it is
+// surfaced in the message_start usage block so downstream consumers (e.g. a
+// second sub2api instance acting as a relay) can record it without waiting
+// for the message_delta at the end of the stream.
 func NewAnthropicSSEEncoder(w io.Writer, flush func(), model string) *AnthropicSSEEncoder {
 	return &AnthropicSSEEncoder{
 		w:          w,
@@ -240,6 +244,15 @@ func NewAnthropicSSEEncoder(w io.Writer, flush func(), model string) *AnthropicS
 		model:      model,
 		messageID:  "msg_" + strings.ReplaceAll(uuid.NewString(), "-", "")[:24],
 		toolBlocks: make(map[string]int),
+	}
+}
+
+// SetInputTokensHint pre-populates the input token count that will be
+// emitted in message_start. Call this before the first Emit/Start so the
+// hint is visible to relay consumers from the very first SSE frame.
+func (e *AnthropicSSEEncoder) SetInputTokensHint(n int64) {
+	if n > 0 && e.inputTokens == 0 {
+		e.inputTokens = n
 	}
 }
 
@@ -274,7 +287,7 @@ func (e *AnthropicSSEEncoder) Start() error {
 			"stop_reason":   nil,
 			"stop_sequence": nil,
 			"usage": map[string]any{
-				"input_tokens":  0,
+				"input_tokens":  e.inputTokens,
 				"output_tokens": 0,
 			},
 		},
@@ -372,7 +385,7 @@ func (e *AnthropicSSEEncoder) Emit(ev *StreamEvent) error {
 		e.toolBlocks[ev.ToolUseID] = idx
 		block := map[string]any{
 			"type":  "tool_use",
-			"id":    ev.ToolUseID,
+			"id":    normalizeToolUseID(ev.ToolUseID),
 			"name":  ev.ToolName,
 			"input": map[string]any{},
 		}
@@ -771,4 +784,18 @@ func firstNonEmpty(a, b string) string {
 		return a
 	}
 	return b
+}
+
+// normalizeToolUseID converts Kiro's tool_use ID format ("tooluse_xxx") to
+// the Anthropic format ("toolu_xxx") that Claude Code expects. Without this
+// prefix, Claude Code treats the tool_use block as plain text instead of
+// executing the tool.
+func normalizeToolUseID(id string) string {
+	if strings.HasPrefix(id, "tooluse_") {
+		return "toolu_" + id[len("tooluse_"):]
+	}
+	if strings.HasPrefix(id, "toolu_") {
+		return id // already correct
+	}
+	return "toolu_" + id
 }

@@ -232,6 +232,14 @@ func (s *KiroGatewayService) Forward(
 
 	encoder := kiro.NewAnthropicSSEEncoder(c.Writer, flush, parsed.Model)
 
+	// Pre-populate input_tokens in message_start so relay consumers (e.g. a
+	// second sub2api instance) can record it without waiting for message_delta.
+	// Kiro upstream does not report input_tokens; we estimate from body size.
+	estimatedInput := estimateKiroInputTokens(parsed)
+	if estimatedInput > 0 {
+		encoder.SetInputTokensHint(int64(estimatedInput))
+	}
+
 	// Install the web_search interceptor: when the Kiro model invokes
 	// `WebSearch` / `web_search`, the interceptor runs the search via
 	// Kiro's /mcp endpoint and then launches a follow-up
