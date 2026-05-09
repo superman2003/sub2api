@@ -8,15 +8,22 @@
 [![Redis](https://img.shields.io/badge/Redis-7+-DC382D.svg)](https://redis.io/)
 [![Docker](https://img.shields.io/badge/Docker-Ready-2496ED.svg)](https://www.docker.com/)
 
-<a href="https://trendshift.io/repositories/21823" target="_blank"><img src="https://trendshift.io/api/badge/repositories/21823" alt="Wei-Shaw%2Fsub2api | Trendshift" width="250" height="55"/></a>
-
 **AI API 网关平台 - 订阅配额分发管理**
 
 [English](README.md) | 中文 | [日本語](README_JA.md)
 
 </div>
 
-> **Sub2API 官方仅使用  `sub2api.org` 与 `pincc.ai` 两个域名。其他使用 Sub2API 名义的网站可能为第三方部署或服务，与本项目无关，请自行甄别。**
+> ## ⚠️ Fork 说明
+>
+> 本仓库是 [Wei-Shaw/sub2api](https://github.com/Wei-Shaw/sub2api) 的**个人 Fork**,遵循与上游项目相同的 **GNU LGPL v3.0** 开源许可证。本 Fork 的修改清单见 [`CHANGES.md`](CHANGES.md)。
+>
+> 本 Fork **不隶属于**上游项目、其维护者、赞助商,也与官方域名 `sub2api.org` / `pincc.ai` **没有任何关联**。有关官方项目的 Issue、Bug 报告、商业合作与功能需求,请直接前往 [上游仓库](https://github.com/Wei-Shaw/sub2api) 反馈。
+>
+> Sub2API 名称及相关品牌资源归上游项目所有,本 Fork 仅出于 LGPL 许可证要求的署名目的予以保留。本 Fork 仅用于技术学习与个人研究,使用风险由使用者自行承担,并请务必遵守所涉上游 AI 服务商的服务条款(ToS)。
+>
+> **上游官方声明**:Sub2API 官方仅使用 `sub2api.org` 与 `pincc.ai` 两个域名。其他使用 Sub2API 名义的网站可能为第三方部署或服务,与上游项目无关,请自行甄别。
+
 ---
 
 ## 在线体验
@@ -45,69 +52,17 @@ Sub2API 是一个 AI API 网关平台，用于分发和管理 AI 产品订阅的
 - **管理后台** - Web 界面进行监控和管理
 - **外部系统集成** - 支持通过 iframe 嵌入外部系统（如工单等），扩展管理后台功能
 
-## ❤️ 赞助商
+<!--
+本 Fork 已移除原 README 的赞助商段落。
+上游项目(Wei-Shaw/sub2api) 的赞助商列表仅针对上游项目本身,本 Fork 无任何赞助商,
+也未与任何上游赞助商或其服务建立关联。
+-->
 
-> [想出现在这里？](mailto:support@pincc.ai)
+## ❤️ 赞助商(仅限上游)
 
-<table>
-<tr>
-<td width="180" align="center" valign="middle"><a href="https://shop.pincc.ai/"><img src="assets/partners/logos/pincc-logo.png" alt="pincc" width="150"></a></td>
-<td valign="middle"><b><a href="https://shop.pincc.ai/">PinCC</a></b> 是基于 Sub2API 搭建的官方中转服务，提供 Claude Code、Codex、Gemini 等主流模型的稳定中转，开箱即用，免去自建部署与运维烦恼。</td>
-</tr>
+上游项目 [Wei-Shaw/sub2api](https://github.com/Wei-Shaw/sub2api) 有其赞助商与商业合作伙伴列表。这些赞助仅面向上游项目,**不适用于本 Fork**。如对上游赞助商或其服务感兴趣,请参阅 [上游 README](https://github.com/Wei-Shaw/sub2api#readme)。
 
-<tr>
-<td width="180"><a href="https://www.packyapi.com/register?aff=sub2api"><img src="assets/partners/logos/packycode.png" alt="PackyCode" width="150"></a></td>
-<td>感谢 PackyCode 赞助了本项目！PackyCode 是一家稳定、高效的API中转服务商，提供 Claude Code、Codex、Gemini 等多种中转服务。PackyCode 为本软件的用户提供了特别优惠，使用<a href="https://www.packyapi.com/register?aff=sub2api">此链接</a>注册并在充值时填写"sub2api"优惠码，首次充值可以享受9折优惠！</td>
-</tr>
-
-<tr>
-<td width="180"><a href="https://poixe.com/i/sub2api"><img src="assets/partners/logos/poixe.png" alt="PoixeAI" width="150"></a></td>
-<td>感谢 Poixe AI 赞助了本项目！Poixe AI 提供可靠的 AI 模型接口服务，您可以使用平台提供的 LLM API 接口轻松构建 AI 产品，同时也可以成为供应商，为平台提供大模型资源以赚取收益。通过 <a href="https://poixe.com/i/sub2api">此链接</a> 专属链接注册，充值额外赠送 $5 美金</td>
-</tr>
-
-<tr>
-<td width="180"><a href="https://ctok.ai"><img src="assets/partners/logos/ctok.png" alt="CTok" width="150"></a></td>
-<td>感谢 CTok.ai 赞助了本项目！CTok.ai 致力于打造一站式 AI 编程工具服务平台。我们提供 Claude Code 专业套餐及技术社群服务，同时支持 Google Gemini 和 OpenAI Codex。通过精心设计的套餐方案和专业的技术社群，为开发者提供稳定的服务保障和持续的技术支持，让 AI 辅助编程真正成为开发者的生产力工具。点击<a href="https://ctok.ai">这里</a>注册！</td>
-</tr>
-
-<tr>
-<td width="180"><a href="https://code.silkapi.com/"><img src="assets/partners/logos/silkapi.png" alt="silkapi" width="150"></a></td>
-<td>感谢 丝绸API 赞助了本项目！ <a href="https://code.silkapi.com/">丝绸API</a> 是基于 Sub2API 搭建的中转服务，专注于提供 Codex 高速稳定API中转。</td>
-</tr>
-
-<tr>
-<td width="180"><a href="https://ylscode.com/"><img src="assets/partners/logos/ylscode.png" alt="ylscode" width="150"></a></td>
-<td>感谢 伊莉思Code 赞助了本项目！ <a href="https://ylscode.com/">伊莉思Code</a> 致力于构建安全的企业级Coding Agent生产力服务，提供稳定快速的 Codex / Claude / Gemini 订阅服务与即用即付API多种方案灵活选择，限时注册赠送 3 天 Codex 试用福利！</td>
-</tr>
-
-<tr>
-<td width="180"><a href="https://www.aicodemirror.com/register?invitecode=KMVZQM"><img src="assets/partners/logos/AICodeMirror.jpg" alt="AICodeMirror" width="150"></a></td>
-<td>感谢 AICodeMirror 赞助了本项目！AICodeMirror 提供 Claude Code / Codex / Gemini CLI 官方高稳定性中转服务，企业级并发、快速开票、7×24 小时专属技术支持。Claude Code / Codex / Gemini 官方通道低至原价 38% / 2% / 9%，充值更享额外折扣！AICodeMirror 为 sub2api 用户提供专属福利：通过<a href="https://www.aicodemirror.com/register?invitecode=KMVZQM">此链接</a>注册，首次充值立享 8 折优惠，企业客户最高可享 75 折！</td>
-</tr>
-
-<tr>
-<td width="180"><a href="https://aigocode.com/invite/SUB2API"><img src="assets/partners/logos/aigocode.png" alt="AIGoCode" width="150"></a></td>
-<td>感谢 AIGoCode 赞助了本项目！AIGoCode 是一站式集成 Claude Code、Codex 以及最新 Gemini 模型的综合平台，为您提供稳定、高效、高性价比的 AI 编程服务。平台提供灵活的订阅方案，零封号风险，免 VPN 直连，响应极速。AIGoCode 为 sub2api 用户准备了专属福利：通过<a href="https://aigocode.com/invite/SUB2API">此链接</a>注册，首次充值可额外获得 10% 赠送额度！</td>
-</tr>
-
-<tr>
-<td width="180"><a href="https://shop.bmoplus.com/?utm_source=github"><img src="assets/partners/logos/bmoplus.jpg" alt="bmoplus" width="150"></a></td>
-<td>感谢 BmoPlus 赞助了本项目！BmoPlus 是一家专为AI订阅重度用户打造的可靠 AI 账号代充服务商，提供稳定的 ChatGPT Plus / ChatGPT Pro(全程质保) / Claude Pro / Super Grok / Gemini Pro 的官方代充&成品账号。 通过<a href="https://shop.bmoplus.com/?utm_source=github">BmoPlus AI成品号专卖/代充</a>注册下单的用户，可享GPT 官网订阅一折 的震撼价格！</td>
-</tr>
-
-<tr>
-<td width="180"><a href="https://bestproxy.com/?keyword=a2e8iuol"><img src="assets/partners/logos/bestproxy.png" alt="bestproxy" width="150"></a></td>
-<td>感谢 Bestproxy 赞助了本项目！<a href="https://bestproxy.com/?keyword=a2e8iuol">Bestproxy</a> 是一家提供高纯度住宅IP，支持一号一IP独享，结合真实家庭网络与指纹隔离，可实现链路环境隔离，降低关联风控概率。</td>
-</tr>
-
-<tr>
-<td width="180"><a href="https://pateway.ai/?ch=1tsfr51"><img src="assets/partners/logos/pateway.png" alt="pateway" width="150"></a></td>
-<td>感谢 PatewayAI 赞助了本项目！PatewayAI 是一家面向重度 AI 开发者、专注官方直连的高品质模型 API 中转服务商。提供 Claude 全系列与 Codex 系列模型，100% 官方源直供，不掺假不注水，欢迎检验。计费透明，Token 级账单可逐笔核验。
-同时支持企业级高并发，并为企业客户提供了专业的管理平台，企业客户可签订正式合同并开具发票，更多详情进入官网获取联系方式。
-现在通过 <a href="https://pateway.ai/?ch=1tsfr51">此链接</a> 注册即送 $3 试用额度，用户充值低至 6 折，邀请好友双向赠送，邀请奖励可达 $150。</td>
-</tr>
-
-</table>
+本 Fork 已移除原 README 中的全部赞助商 logo 与推广内容,以避免造成任何"本 Fork 受赞助/被背书"的误解。
 
 ## 生态项目
 
@@ -691,9 +646,12 @@ sub2api/
 
 ## 许可证
 
-本项目基于 [GNU 宽通用公共许可证 v3.0](LICENSE)（或更高版本）授权。
+本项目基于 [GNU 宽通用公共许可证 v3.0](LICENSE)(或更高版本)授权,与上游项目采用同一许可证。
 
-Copyright (c) 2026 Wesley Liddick
+- 上游版权:Copyright (c) 2026 Wesley Liddick — [Wei-Shaw/sub2api](https://github.com/Wei-Shaw/sub2api)
+- 本 Fork 的修改:见 [`CHANGES.md`](CHANGES.md)
+
+本 Fork 的修改代码同样按 LGPL-3.0-or-later 许可证发布。本 Fork 不主张对原 Sub2API 代码或其相关商标的所有权。"Sub2API" 名称、项目 Logo、赞助商 Logo 等品牌资产归各自所有权人所有,除 LGPL-3.0 许可证为署名之需所要求的范围外,**并未授权给本 Fork 使用**。
 
 ---
 
