@@ -3,6 +3,8 @@ package kiro
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -212,6 +214,12 @@ type AnthropicSSEEncoder struct {
 	// currently active. Mutually exclusive with textBlockOpen — switching
 	// between thinking and text closes the other block first.
 	thinkingBlockOpen bool
+	// thinkingBuf accumulates the raw text of the current thinking block
+	// so closeCurrentNonToolBlock can emit a stable synthetic
+	// signature_delta. Claude Code's UI silently hides thinking blocks
+	// that arrive without a signature, so we derive one deterministically
+	// from the thinking text itself.
+	thinkingBuf       strings.Builder
 	blockIndex        int
 	toolBlocks        map[string]int // toolUseID -> block index
 	inputTokens       int64
@@ -327,8 +335,9 @@ func (e *AnthropicSSEEncoder) Emit(ev *StreamEvent) error {
 				"type":  "content_block_start",
 				"index": e.blockIndex,
 				"content_block": map[string]any{
-					"type":     "thinking",
-					"thinking": "",
+					"type":      "thinking",
+					"thinking":  "",
+					"signature": "",
 				},
 			}); err != nil {
 				return err
@@ -344,6 +353,11 @@ func (e *AnthropicSSEEncoder) Emit(ev *StreamEvent) error {
 		}); err != nil {
 			return err
 		}
+		// Accumulate thinking text so Finish-time / block-close code can
+		// produce a stable synthetic signature. Kiro has no native
+		// signed-thinking output; without some signature at all the
+		// Claude Code UI silently hides the thinking block.
+		e.thinkingBuf.WriteString(ev.Text)
 		e.outputTokens += int64(len(ev.Text) / 4)
 		return nil
 
@@ -458,6 +472,25 @@ func (e *AnthropicSSEEncoder) closeCurrentNonToolBlock() error {
 	if !e.textBlockOpen && !e.thinkingBlockOpen {
 		return nil
 	}
+	// Emit a synthetic signature before closing a thinking block. Claude
+	// Code's UI hides thinking blocks that finish without a signature,
+	// so we produce a stable, self-derived value. Genuine Anthropic
+	// signatures are server-signed base64 blobs; our synthetic one is
+	// clearly marked so downstream consumers can distinguish them.
+	if e.thinkingBlockOpen {
+		sig := syntheticThinkingSignature(e.thinkingBuf.String())
+		if err := e.write("content_block_delta", map[string]any{
+			"type":  "content_block_delta",
+			"index": e.blockIndex,
+			"delta": map[string]any{
+				"type":      "signature_delta",
+				"signature": sig,
+			},
+		}); err != nil {
+			return err
+		}
+		e.thinkingBuf.Reset()
+	}
 	if err := e.write("content_block_stop", map[string]any{
 		"type":  "content_block_stop",
 		"index": e.blockIndex,
@@ -468,6 +501,16 @@ func (e *AnthropicSSEEncoder) closeCurrentNonToolBlock() error {
 	e.thinkingBlockOpen = false
 	e.blockIndex++
 	return nil
+}
+
+// syntheticThinkingSignature derives a stable identifier for a thinking
+// block. Anthropic's native signatures are server-signed; we can't forge
+// those, but any non-empty signature is enough to keep Claude Code's UI
+// from hiding the block. The prefix makes it clear the signature is
+// gateway-synthesised and not from Anthropic.
+func syntheticThinkingSignature(thinking string) string {
+	sum := sha256.Sum256([]byte(thinking))
+	return "sub2api-kiro-emulated:" + hex.EncodeToString(sum[:16])
 }
 
 // Finish closes any open blocks and emits message_delta/message_stop.

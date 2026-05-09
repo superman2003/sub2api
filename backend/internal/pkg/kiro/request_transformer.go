@@ -227,7 +227,7 @@ func BuildKiroPayload(req *AnthropicRequest, opts BuildOptions) (map[string]any,
 	// transformer (ThinkingSplitter) then peels those blocks out and
 	// emits them as proper Anthropic thinking_delta events.
 	if isThinkingRequested(req.Thinking) {
-		currentText = buildThinkingPreamble(req.Thinking) + "\n\n" + currentText
+		currentText = buildThinkingPreamble(req.Thinking, req.MaxTokens) + "\n\n" + currentText
 	}
 
 	// Build userInputMessageContext (tools + toolResults; images are inline).
@@ -484,20 +484,35 @@ func isThinkingRequested(th *AnthropicThinking) bool {
 	return th.BudgetTokens > 0
 }
 
-// buildThinkingPreamble returns the system-level instruction prepended to
-// the current user message so the Kiro model emits its reasoning inside
-// <thinking>...</thinking> tags. Budget is passed through as a soft hint.
-func buildThinkingPreamble(th *AnthropicThinking) string {
+// buildThinkingPreamble returns the instruction prepended to the current
+// user turn so the Kiro model emits its reasoning inside
+// <thinking>...</thinking> tags. The budget (max_thinking_length) is a
+// soft hint to the model; we cap it at roughly a third of the caller's
+// max_tokens so there's always room left over for the final answer.
+//
+// The preamble is deliberately written in a neutral, brief form so it
+// does not distract the model from the actual user request — earlier
+// versions that used strong imperatives ("Keep reasoning concise and
+// stop...") were observed to cause the model to truncate its final
+// answer after closing the thinking block.
+func buildThinkingPreamble(th *AnthropicThinking, maxTokens int) string {
 	budget := 4000
 	if th != nil && th.BudgetTokens > 0 {
 		budget = th.BudgetTokens
 	}
+	// Cap the advertised budget so the model keeps output headroom.
+	// Default behaviour for typical 32k max_tokens: budget stays <= 10k.
+	if maxTokens > 0 {
+		if cap := maxTokens / 3; cap > 0 && budget > cap {
+			budget = cap
+		}
+	}
 	return fmt.Sprintf(
-		`<thinking_mode>enabled</thinking_mode>`+
-			`<max_thinking_length>%d</max_thinking_length>`+
-			`Before answering, reason step by step inside <thinking>...</thinking> tags. `+
-			`Keep the reasoning concise and stop once you have a plan. `+
-			`After the closing </thinking> tag, write your final answer as normal.`,
+		`[thinking_mode=enabled max_thinking_length=%d]`+"\n"+
+			`You may use <thinking>...</thinking> at the very start of your reply to reason privately about the request. `+
+			`Whatever is inside the tags is internal; the user sees only what comes after the closing </thinking> tag. `+
+			`The thinking block is optional — skip it for simple questions. `+
+			`After </thinking>, respond to the user's request in full as you normally would, with no length restriction.`,
 		budget,
 	)
 }

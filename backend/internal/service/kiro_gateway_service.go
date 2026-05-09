@@ -404,6 +404,13 @@ func parsedToKiroAnthropic(p *ParsedRequest) (*kiro.AnthropicRequest, error) {
 	if raw, ok := body["max_tokens"].(float64); ok {
 		req.MaxTokens = int(raw)
 	}
+	// Lift a too-small max_tokens floor. Some clients (Claude Code CLI in
+	// particular) hard-code max_tokens: 8000, which collapses into the
+	// thinking budget and leaves nothing for the actual answer. Local
+	// users going through their own Kiro account can afford a much
+	// bigger ceiling; raise the floor to 32 000 by default, overridable
+	// through SUB2API_KIRO_MAX_TOKENS_FLOOR (set to "0" to disable).
+	req.MaxTokens = maybeLiftMaxTokensFloor(req.MaxTokens)
 	if raw, ok := body["temperature"].(float64); ok {
 		v := raw
 		req.Temperature = &v
@@ -533,4 +540,58 @@ func kiroFirstNonEmpty(a, b string) string {
 		return a
 	}
 	return b
+}
+
+
+// defaultKiroMaxTokensFloor is the default lower bound we raise client-
+// sent max_tokens to before forwarding to Kiro. Claude Code CLI hard-
+// codes 8000 in its SDK which collapses to zero room for the final
+// answer when combined with a thinking budget. Kiro CodeWhisperer
+// comfortably accepts much larger values; 32 000 is a safe compromise
+// that leaves space for both extended reasoning and a full response.
+const defaultKiroMaxTokensFloor = 32000
+
+// maybeLiftMaxTokensFloor returns max(current, floor) unless the operator
+// has opted out via SUB2API_KIRO_MAX_TOKENS_FLOOR. Settings:
+//
+//   - unset / invalid → use defaultKiroMaxTokensFloor (32 000)
+//   - "0"             → disabled; return the client value untouched
+//   - positive int    → use that as the floor
+//
+// Zero or negative input is left alone; we don't invent a floor when the
+// client explicitly asked for no limit.
+func maybeLiftMaxTokensFloor(current int) int {
+	if current <= 0 {
+		return current
+	}
+	floor := defaultKiroMaxTokensFloor
+	if raw := strings.TrimSpace(os.Getenv("SUB2API_KIRO_MAX_TOKENS_FLOOR")); raw != "" {
+		if parsed, err := parseNonNegativeInt(raw); err == nil {
+			if parsed == 0 {
+				return current
+			}
+			floor = parsed
+		}
+	}
+	if current < floor {
+		return floor
+	}
+	return current
+}
+
+// parseNonNegativeInt is a tiny strconv-free int parser so this package
+// doesn't grow a strconv import for one call-site. Accepts decimal digits
+// only.
+func parseNonNegativeInt(s string) (int, error) {
+	if s == "" {
+		return 0, fmt.Errorf("empty")
+	}
+	n := 0
+	for _, c := range s {
+		if c < '0' || c > '9' {
+			return 0, fmt.Errorf("non-digit %q", c)
+		}
+		n = n*10 + int(c-'0')
+	}
+	return n, nil
 }
