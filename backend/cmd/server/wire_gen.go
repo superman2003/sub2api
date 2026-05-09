@@ -190,6 +190,7 @@ func initializeApplication(buildInfo handler.BuildInfo) (*Application, error) {
 	// Retrofit web-search emulation deps into KiroGatewayService; both services
 	// are now instantiated so it is safe to wire them together without cycles.
 	kiroGatewayService.SetWebSearchDeps(channelService)
+	kiroGatewayService.SetWebSearchMCPCache(redisClient)
 	modelPricingResolver := service.NewModelPricingResolver(channelService, billingService)
 	balanceNotifyService := service.ProvideBalanceNotifyService(emailService, settingRepository, accountRepository)
 	gatewayService := service.NewGatewayService(accountRepository, groupRepository, usageLogRepository, usageBillingRepository, userRepository, userSubscriptionRepository, userGroupRateRepository, gatewayCache, configConfig, schedulerSnapshotService, concurrencyService, billingService, rateLimitService, billingCacheService, identityService, httpUpstream, deferredService, claudeTokenProvider, sessionLimitCache, rpmCache, digestSessionStore, settingService, tlsFingerprintProfileService, channelService, modelPricingResolver, balanceNotifyService)

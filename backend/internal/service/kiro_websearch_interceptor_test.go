@@ -18,6 +18,8 @@ func newTestInterceptor(arn string) *kiroWebSearchInterceptor {
 		kiro.BuildOptions{ProfileArn: arn},
 		"https://example.invalid",
 		http.Header{},
+		nil,
+		1,
 	)
 }
 

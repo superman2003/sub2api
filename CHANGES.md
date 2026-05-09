@@ -40,7 +40,40 @@ This fork adds **Kiro platform support** (Amazon Q Developer / CodeWhisperer) an
 - If every submitted tool is dropped, the whole `tools` array is omitted
   instead of sent as `[]`.
 
-### Kiro Native WebSearch (Zero-config, uses the account's own /mcp endpoint)
+### Kiro MCP Result Caching (Redis, 15 min)
+- Added a small `kiroMCPResultCache` helper that stores Kiro /mcp
+  web_search responses in Redis for 15 minutes, keyed by
+  `kiro:mcp:ws:<account_id>:<sha256(query)>`. Results are account-scoped
+  so different Kiro accounts don't share cached hits; query normalisation
+  (lowercase + trim) deduplicates trivially different spellings.
+- `KiroGatewayService` gains a `SetWebSearchMCPCache(*redis.Client)`
+  setter wired up in `wire_gen.go` alongside the existing web-search deps.
+  When Redis isn't configured the cache is a silent no-op.
+- Saves a full Kiro credit round-trip on repeat searches during the same
+  session (e.g. re-asking the same question after a restart).
+- Tests: unit coverage for nil-safety, key stability, and account scoping.
+
+### Kiro Thinking / Extended Reasoning (best-effort)
+- Kiro CodeWhisperer has no native Anthropic thinking API, so the gateway
+  now implements a "fake reasoning" path modelled after jwadow/kiro-gateway:
+  - **Request side**: when the client sends a `thinking` field on
+    `/v1/messages`, the request transformer prepends a
+    `<thinking_mode>enabled</thinking_mode><max_thinking_length>N</max_thinking_length>…`
+    directive to the current user turn, asking the model to wrap its
+    reasoning in `<thinking>...</thinking>` tags.
+  - **Response side**: a new `ThinkingSplitter` processes the streaming
+    assistant text, pulling out any `<thinking>...</thinking>` blocks
+    across chunk boundaries and emitting them as Anthropic
+    `thinking_delta` events. Remaining text streams out as normal
+    `text_delta`. The raw `<thinking>` tags never reach the client.
+- `AnthropicSSEEncoder` now tracks thinking/text/tool blocks as mutually
+  exclusive, opening/closing content blocks correctly as the event
+  sequence transitions between them.
+- Tests: `thinking_splitter_test.go` covers chunk boundaries, multiple
+  thinking blocks in one stream, unterminated thinking on EOF, stray
+  `<` characters, and in-feed coalescing; a new end-to-end test in
+  `interceptor_test.go` verifies the full stream path rewrites tags
+  into proper Anthropic SSE frames.
 - Added `kiro.CallMCPWebSearch` which performs a JSON-RPC 2.0 `tools/call`
   against Kiro's own `/mcp` endpoint
   (`https://q.<region>.amazonaws.com/mcp`), using the caller's existing

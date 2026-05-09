@@ -221,6 +221,15 @@ func BuildKiroPayload(req *AnthropicRequest, opts BuildOptions) (map[string]any,
 		currentText = "Continue"
 	}
 
+	// Kiro has no native thinking/extended-reasoning API. When the client
+	// requests thinking we inject a prompt directive that makes the model
+	// wrap its reasoning in <thinking>...</thinking>; the response
+	// transformer (ThinkingSplitter) then peels those blocks out and
+	// emits them as proper Anthropic thinking_delta events.
+	if isThinkingRequested(req.Thinking) {
+		currentText = buildThinkingPreamble(req.Thinking) + "\n\n" + currentText
+	}
+
 	// Build userInputMessageContext (tools + toolResults; images are inline).
 	userInputContext := map[string]any{}
 	if len(req.Tools) > 0 {
@@ -455,4 +464,40 @@ func extractMessageText(raw json.RawMessage) string {
 		return strings.Join(parts, "\n")
 	}
 	return string(raw)
+}
+
+
+// isThinkingRequested reports whether the caller asked for extended
+// reasoning. Anthropic has two established shapes ("enabled" with a
+// budget_tokens field, and a newer "adaptive" form without one); both
+// are accepted here. An empty/missing Thinking struct returns false.
+func isThinkingRequested(th *AnthropicThinking) bool {
+	if th == nil {
+		return false
+	}
+	switch strings.ToLower(strings.TrimSpace(th.Type)) {
+	case "enabled", "adaptive":
+		return true
+	}
+	// Tolerant fallback: some clients set budget_tokens without the type
+	// field. Treat any positive budget as "thinking requested".
+	return th.BudgetTokens > 0
+}
+
+// buildThinkingPreamble returns the system-level instruction prepended to
+// the current user message so the Kiro model emits its reasoning inside
+// <thinking>...</thinking> tags. Budget is passed through as a soft hint.
+func buildThinkingPreamble(th *AnthropicThinking) string {
+	budget := 4000
+	if th != nil && th.BudgetTokens > 0 {
+		budget = th.BudgetTokens
+	}
+	return fmt.Sprintf(
+		`<thinking_mode>enabled</thinking_mode>`+
+			`<max_thinking_length>%d</max_thinking_length>`+
+			`Before answering, reason step by step inside <thinking>...</thinking> tags. `+
+			`Keep the reasoning concise and stop once you have a plan. `+
+			`After the closing </thinking> tag, write your final answer as normal.`,
+		budget,
+	)
 }

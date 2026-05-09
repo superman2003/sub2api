@@ -77,10 +77,10 @@ type ContextUsageEventPayload struct {
 // StreamEvent is the canonical shape emitted by our EventStream -> internal
 // event pipeline. The handler layer converts it to Anthropic SSE framing.
 type StreamEvent struct {
-	// Kind is one of: content, tool_use_start, tool_use_delta, tool_use_stop,
-	// usage, metering, context_usage, error, done
+	// Kind is one of: content, thinking, tool_use_start, tool_use_delta,
+	// tool_use_stop, usage, metering, context_usage, error, done
 	Kind string
-	// Text for content events.
+	// Text for content events; Thinking payload for thinking events.
 	Text string
 	// Tool use fields
 	ToolName   string
@@ -208,10 +208,14 @@ type AnthropicSSEEncoder struct {
 	model         string
 	messageID     string
 	textBlockOpen bool
-	blockIndex    int
-	toolBlocks    map[string]int // toolUseID -> block index
-	inputTokens   int64
-	outputTokens  int64
+	// thinkingBlockOpen tracks whether a thinking content_block is
+	// currently active. Mutually exclusive with textBlockOpen — switching
+	// between thinking and text closes the other block first.
+	thinkingBlockOpen bool
+	blockIndex        int
+	toolBlocks        map[string]int // toolUseID -> block index
+	inputTokens       int64
+	outputTokens      int64
 	// Kiro-specific aggregates captured during the stream.
 	meteringCredit  float64
 	meteringUnit    string
@@ -280,6 +284,11 @@ func (e *AnthropicSSEEncoder) Emit(ev *StreamEvent) error {
 	}
 	switch ev.Kind {
 	case "content":
+		if e.thinkingBlockOpen {
+			if err := e.closeCurrentNonToolBlock(); err != nil {
+				return err
+			}
+		}
 		if !e.textBlockOpen {
 			e.textBlockOpen = true
 			if err := e.write("content_block_start", map[string]any{
@@ -306,17 +315,44 @@ func (e *AnthropicSSEEncoder) Emit(ev *StreamEvent) error {
 		e.outputTokens += int64(len(ev.Text) / 4) // rough
 		return nil
 
-	case "tool_use_start":
-		// Close any open text block before starting a tool block.
+	case "thinking":
 		if e.textBlockOpen {
-			if err := e.write("content_block_stop", map[string]any{
-				"type":  "content_block_stop",
+			if err := e.closeCurrentNonToolBlock(); err != nil {
+				return err
+			}
+		}
+		if !e.thinkingBlockOpen {
+			e.thinkingBlockOpen = true
+			if err := e.write("content_block_start", map[string]any{
+				"type":  "content_block_start",
 				"index": e.blockIndex,
+				"content_block": map[string]any{
+					"type":     "thinking",
+					"thinking": "",
+				},
 			}); err != nil {
 				return err
 			}
-			e.textBlockOpen = false
-			e.blockIndex++
+		}
+		if err := e.write("content_block_delta", map[string]any{
+			"type":  "content_block_delta",
+			"index": e.blockIndex,
+			"delta": map[string]any{
+				"type":     "thinking_delta",
+				"thinking": ev.Text,
+			},
+		}); err != nil {
+			return err
+		}
+		e.outputTokens += int64(len(ev.Text) / 4)
+		return nil
+
+	case "tool_use_start":
+		// Close any open text or thinking block before starting a tool block.
+		if e.textBlockOpen || e.thinkingBlockOpen {
+			if err := e.closeCurrentNonToolBlock(); err != nil {
+				return err
+			}
 		}
 		idx := e.blockIndex
 		e.toolBlocks[ev.ToolUseID] = idx
@@ -414,18 +450,33 @@ func (e *AnthropicSSEEncoder) Emit(ev *StreamEvent) error {
 	return nil
 }
 
+// closeCurrentNonToolBlock finalises whichever of text/thinking block is
+// currently open and advances the block index. No-op when nothing is
+// open. Tool blocks have their own lifecycle managed via toolBlocks and
+// are untouched here.
+func (e *AnthropicSSEEncoder) closeCurrentNonToolBlock() error {
+	if !e.textBlockOpen && !e.thinkingBlockOpen {
+		return nil
+	}
+	if err := e.write("content_block_stop", map[string]any{
+		"type":  "content_block_stop",
+		"index": e.blockIndex,
+	}); err != nil {
+		return err
+	}
+	e.textBlockOpen = false
+	e.thinkingBlockOpen = false
+	e.blockIndex++
+	return nil
+}
+
 // Finish closes any open blocks and emits message_delta/message_stop.
 func (e *AnthropicSSEEncoder) Finish(stopReason string) error {
 	if err := e.Start(); err != nil {
 		return err
 	}
-	if e.textBlockOpen {
-		_ = e.write("content_block_stop", map[string]any{
-			"type":  "content_block_stop",
-			"index": e.blockIndex,
-		})
-		e.textBlockOpen = false
-		e.blockIndex++
+	if e.textBlockOpen || e.thinkingBlockOpen {
+		_ = e.closeCurrentNonToolBlock()
 	}
 	for id, idx := range e.toolBlocks {
 		_ = e.write("content_block_stop", map[string]any{
@@ -537,11 +588,33 @@ func DriveEventStreamToAnthropicWithInterceptor(
 	// tool_use_delta before downstream logic runs.
 	seenStarts := make(map[string]struct{})
 
+	// thinkSplitter converts raw assistant text — which may include
+	// <thinking>...</thinking> blocks when we injected the
+	// thinking_mode=enabled prompt — into a mix of content and thinking
+	// events. Stateful across chunks to handle tags split at arbitrary
+	// boundaries.
+	thinkSplitter := &ThinkingSplitter{}
+
 	emit := func(ev *StreamEvent) error {
 		if ev.Kind == "content" {
 			textBuf.WriteString(ev.Text)
 		}
 		return enc.Emit(ev)
+	}
+
+	// emitParsed runs a (possibly content) event through the thinking
+	// splitter and forwards whatever it produces. Non-content events pass
+	// straight through.
+	emitParsed := func(ev *StreamEvent) error {
+		if ev.Kind != "content" {
+			return emit(ev)
+		}
+		for _, out := range thinkSplitter.Feed(ev.Text) {
+			if err := emit(out); err != nil {
+				return err
+			}
+		}
+		return nil
 	}
 
 	for {
@@ -551,6 +624,13 @@ func DriveEventStreamToAnthropicWithInterceptor(
 		msg, err := reader.Next()
 		if err != nil {
 			if errors.Is(err, io.EOF) {
+				// Flush any trailing bytes still held by the thinking
+				// splitter so unterminated chunks reach the client.
+				for _, out := range thinkSplitter.Flush() {
+					if eerr := emit(out); eerr != nil {
+						return textBuf.String(), eerr
+					}
+				}
 				// Flush any intercepted tool_use lifecycles that did not
 				// receive an explicit stop frame. Kiro's streaming format
 				// does not always emit a trailing stop so we finalise
@@ -635,7 +715,7 @@ func DriveEventStreamToAnthropicWithInterceptor(
 			}
 		}
 
-		if err := emit(ev); err != nil {
+		if err := emitParsed(ev); err != nil {
 			return textBuf.String(), err
 		}
 	}

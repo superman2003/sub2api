@@ -105,6 +105,37 @@ func TestDriveEventStream_MultipleStartFramesAccumulateInput(t *testing.T) {
 	require.Equal(t, `{"query":"today news 2026"}`, interceptor.seenInput)
 }
 
+// TestDriveEventStream_ThinkingSplitterRewritesTags verifies that raw
+// assistant text containing <thinking>...</thinking> blocks is rewritten
+// into separate SSE thinking + text content blocks by the driver's
+// splitter, with tool_use frames still flowing through normally.
+func TestDriveEventStream_ThinkingSplitterRewritesTags(t *testing.T) {
+	stream := concat(
+		testFrameJSON("assistantResponseEvent", map[string]any{
+			"content": "<thinking>plan: check docs</thinking>Here's the answer.",
+		}),
+	)
+
+	var out bytes.Buffer
+	enc := NewAnthropicSSEEncoder(&out, nil, "claude-sonnet-4.5")
+	_, err := DriveEventStreamToAnthropicWithInterceptor(
+		context.Background(), bytes.NewReader(stream), enc, nil,
+	)
+	require.NoError(t, err)
+	require.NoError(t, enc.Finish("end_turn"))
+
+	sse := out.String()
+	require.Contains(t, sse, `"type":"thinking"`,
+		"thinking content_block should be emitted")
+	require.Contains(t, sse, `"type":"thinking_delta"`,
+		"thinking_delta should be emitted")
+	require.Contains(t, sse, `"thinking":"plan: check docs"`)
+	require.Contains(t, sse, `"type":"text"`, "text content_block should follow")
+	require.Contains(t, sse, "Here's the answer.")
+	require.NotContains(t, sse, "<thinking>",
+		"raw <thinking> tag must not leak to the client")
+}
+
 // TestDriveEventStream_EOFFlushFinalisesPendingInterceptedTool verifies
 // that if Kiro ends the stream without an explicit tool_use_stop frame,
 // the driver still flushes the interceptor so the client sees a response.

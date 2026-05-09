@@ -38,13 +38,15 @@ type kiroWebSearchInterceptor struct {
 	buildOpts kiro.BuildOptions
 	endpoint  string
 	headers   http.Header
+	cache     *kiroMCPResultCache
+	accountID int64
 }
 
 // newKiroWebSearchInterceptor constructs an interceptor bound to a single
 // Kiro request. The http.Client should already honour any account-specific
 // proxy configuration. anthReq is the original parsed request; a shallow
 // copy is made so that appending tool-call turns does not mutate the
-// caller's state.
+// caller's state. cache is optional; pass nil to disable result caching.
 func newKiroWebSearchInterceptor(
 	ctx context.Context,
 	client *http.Client,
@@ -53,6 +55,8 @@ func newKiroWebSearchInterceptor(
 	buildOpts kiro.BuildOptions,
 	endpoint string,
 	headers http.Header,
+	cache *kiroMCPResultCache,
+	accountID int64,
 ) *kiroWebSearchInterceptor {
 	region := kiro.RegionFromProfileArn(buildOpts.ProfileArn)
 	if region == "" {
@@ -67,6 +71,8 @@ func newKiroWebSearchInterceptor(
 		buildOpts: buildOpts,
 		endpoint:  endpoint,
 		headers:   headers,
+		cache:     cache,
+		accountID: accountID,
 	}
 }
 
@@ -119,16 +125,26 @@ func (i *kiroWebSearchInterceptor) OnToolStop(
 	slog.Info("kiro web_search interceptor: executing MCP query",
 		"tool_use_id", toolUseID, "query", query, "region", i.region)
 
-	mcpResp, err := kiro.CallMCPWebSearch(ctx, i.client, i.region, i.token, query)
-	if err != nil {
-		slog.Error("kiro web_search interceptor: MCP call failed", "error", err)
-		return emit(&kiro.StreamEvent{
-			Kind: "content",
-			Text: fmt.Sprintf(
-				"\n<web_search>\nWeb search failed: %s\n</web_search>\n",
-				err.Error(),
-			),
-		})
+	var mcpResp *kiro.MCPWebSearchResponse
+	if cached := i.cache.Get(ctx, i.accountID, query); cached != nil {
+		slog.Info("kiro web_search interceptor: cache hit",
+			"tool_use_id", toolUseID, "query", query,
+			"results", len(cached.Results))
+		mcpResp = cached
+	} else {
+		resp, err := kiro.CallMCPWebSearch(ctx, i.client, i.region, i.token, query)
+		if err != nil {
+			slog.Error("kiro web_search interceptor: MCP call failed", "error", err)
+			return emit(&kiro.StreamEvent{
+				Kind: "content",
+				Text: fmt.Sprintf(
+					"\n<web_search>\nWeb search failed: %s\n</web_search>\n",
+					err.Error(),
+				),
+			})
+		}
+		mcpResp = resp
+		i.cache.Set(ctx, i.accountID, query, mcpResp)
 	}
 
 	// The MCP payload is our source of truth for the follow-up turn.

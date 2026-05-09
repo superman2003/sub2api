@@ -21,6 +21,7 @@ import (
 	"github.com/Wei-Shaw/sub2api/internal/pkg/proxyurl"
 
 	"github.com/gin-gonic/gin"
+	"github.com/redis/go-redis/v9"
 	"github.com/tidwall/gjson"
 )
 
@@ -46,6 +47,12 @@ type KiroGatewayService struct {
 	// SetWebSearchDeps to avoid a wire cycle (ChannelService is constructed
 	// later in the wire graph than KiroGatewayService).
 	channelService *ChannelService
+	// mcpResultCache is an optional Redis-backed cache for web_search MCP
+	// responses; populated via SetWebSearchMCPCache after construction so
+	// we avoid adding a new required dependency to NewKiroGatewayService
+	// (and therefore avoid regenerating wire). When nil, every search
+	// round-trips to Kiro as before.
+	mcpResultCache *kiroMCPResultCache
 	// httpClient is reused across requests; Kiro happily serves multiple
 	// sequential streaming calls over the same HTTP/2 connection so a single
 	// pool is fine.
@@ -84,6 +91,16 @@ func (s *KiroGatewayService) SetWebSearchDeps(ch *ChannelService) {
 		return
 	}
 	s.channelService = ch
+}
+
+// SetWebSearchMCPCache wires in an optional Redis-backed cache for
+// /mcp web_search responses. Skipping this call leaves the cache nil
+// and search results are always re-fetched.
+func (s *KiroGatewayService) SetWebSearchMCPCache(rdb *redis.Client) {
+	if s == nil {
+		return
+	}
+	s.mcpResultCache = newKiroMCPResultCache(rdb)
 }
 
 // kiroWebSearchDeps adapts *KiroGatewayService's local state to the shared
@@ -230,6 +247,8 @@ func (s *KiroGatewayService) Forward(
 		},
 		kiroUpstreamEndpoint,
 		kiroUpstreamHeaders(token),
+		s.mcpResultCache,
+		account.ID,
 	)
 	text, err := kiro.DriveEventStreamToAnthropicWithInterceptor(forwardCtx, resp.Body, encoder, interceptor)
 	if err != nil && !errors.Is(err, context.Canceled) {
@@ -392,6 +411,16 @@ func parsedToKiroAnthropic(p *ParsedRequest) (*kiro.AnthropicRequest, error) {
 	if raw, ok := body["top_p"].(float64); ok {
 		v := raw
 		req.TopP = &v
+	}
+	if raw, ok := body["thinking"].(map[string]any); ok {
+		thinking := &kiro.AnthropicThinking{}
+		if t, ok := raw["type"].(string); ok {
+			thinking.Type = t
+		}
+		if b, ok := raw["budget_tokens"].(float64); ok {
+			thinking.BudgetTokens = int(b)
+		}
+		req.Thinking = thinking
 	}
 	if raw, ok := body["messages"].([]any); ok {
 		msgs := make([]kiro.AnthropicMessage, 0, len(raw))
