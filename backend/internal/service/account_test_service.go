@@ -1546,9 +1546,9 @@ func (s *AccountTestService) testKiroAccountConnection(c *gin.Context, account *
 		return s.sendErrorAndEnd(c, fmt.Sprintf("Failed to get Kiro access token: %s", err.Error()))
 	}
 	profileArn := s.kiroGatewayService.tokenProvider.ProfileArn(account)
-	if profileArn == "" {
-		return s.sendErrorAndEnd(c, "Kiro account missing profile_arn")
-	}
+	// profileArn may be empty for Builder ID accounts; BuildKiroPayload
+	// will simply omit it from the upstream request (Kiro accepts this
+	// for AWS SSO OIDC sessions).
 
 	// Build a minimal Anthropic request and transform it into Kiro payload.
 	userContent, _ := json.Marshal([]map[string]any{

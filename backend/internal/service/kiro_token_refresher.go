@@ -83,6 +83,7 @@ func (r *KiroTokenRefresher) Refresh(ctx context.Context, account *Account) (map
 			ExpiresIn:    oidcResp.ExpiresIn,
 			ExpiresAt:    time.Now().Unix() + oidcResp.ExpiresIn,
 			TokenType:    oidcResp.TokenType,
+			ProfileArn:   oidcResp.ProfileArn,
 		}
 
 	default:

@@ -21,6 +21,7 @@ import (
 	"github.com/Wei-Shaw/sub2api/internal/pkg/proxyurl"
 
 	"github.com/gin-gonic/gin"
+	"github.com/google/uuid"
 	"github.com/redis/go-redis/v9"
 	"github.com/tidwall/gjson"
 )
@@ -158,9 +159,11 @@ func (s *KiroGatewayService) Forward(
 		return nil, fmt.Errorf("kiro token: %w", err)
 	}
 	profileArn := s.tokenProvider.ProfileArn(account)
-	if profileArn == "" {
-		return nil, errors.New("kiro forward: account missing profile_arn")
-	}
+	// profileArn may be empty for Builder ID accounts whose OIDC /token
+	// response did not include it. BuildKiroPayload will simply omit the
+	// field from the upstream request; Kiro accepts this for Builder ID
+	// sessions (profileArn is only strictly required for Desktop Auth /
+	// Google social login accounts).
 
 	// Convert Anthropic payload to Kiro conversationState.
 	anthropicReq, err := parsedToKiroAnthropic(parsed)
@@ -353,10 +356,12 @@ func kiroUpstreamHeaders(token string) http.Header {
 	h.Set("Content-Type", "application/json")
 	h.Set("Accept", "application/json")
 	h.Set("Authorization", "Bearer "+token)
-	h.Set("User-Agent", "aws-sdk-js/1.0.27 KiroIDE-0.7.45-sub2api")
+	h.Set("User-Agent", "aws-sdk-js/1.0.27 ua/2.1 os/win32#10.0.19044 lang/js md/nodejs#22.21.1 api/codewhispererstreaming#1.0.27 m/E KiroIDE-0.7.45-sub2api")
 	h.Set("x-amz-user-agent", "aws-sdk-js/1.0.27 KiroIDE-0.7.45-sub2api")
 	h.Set("x-amzn-codewhisperer-optout", "true")
 	h.Set("x-amzn-kiro-agent-mode", "vibe")
+	h.Set("amz-sdk-invocation-id", uuid.NewString())
+	h.Set("amz-sdk-request", "attempt=1; max=3")
 	return h
 }
 

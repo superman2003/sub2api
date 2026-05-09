@@ -650,6 +650,7 @@ async function createAccountFromBuilderID(tokenData: {
   client_secret?: string
   region?: string
   expires_in?: number
+  profile_arn?: string
 }) {
   loading.value = true
   errorMessage.value = ''
@@ -668,6 +669,7 @@ async function createAccountFromBuilderID(tokenData: {
       client_secret: tokenData.client_secret,
       region: tokenData.region || 'us-east-1',
       expires_in: tokenData.expires_in,
+      profile_arn: tokenData.profile_arn || '',
       name: resolvedName,
       concurrency: resolvedConcurrency,
       priority: props.embedded ? (props.externalPriority ?? undefined) : undefined,

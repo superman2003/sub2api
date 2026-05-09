@@ -469,6 +469,7 @@ func (h *KiroOAuthHandler) PollBuilderIDLogin(c *gin.Context) {
 		"client_id":     sess.ClientID,
 		"client_secret": sess.ClientSecret,
 		"region":        sess.Region,
+		"profile_arn":   tokenResp.ProfileArn,
 	})
 }
 
@@ -508,14 +509,12 @@ func (h *KiroOAuthHandler) CreateAccountFromBuilderID(c *gin.Context) {
 		expiresAt = time.Now().Unix() + req.ExpiresIn
 	}
 
-	// profileArn: if not provided, try to fetch from CodeWhisperer API.
+	// profileArn: if not provided by the OIDC response, leave empty.
+	// Builder ID (AWS SSO OIDC) accounts do NOT need profileArn — Kiro
+	// accepts the request without it. Only Desktop Auth (Google social
+	// login) accounts require it, and those get it from the initial
+	// ExchangeToken response.
 	profileArn := req.ProfileArn
-	if profileArn == "" {
-		// Best-effort: call listProfiles or use a default placeholder.
-		// For now we leave it empty; the first request will fail with a clear
-		// error message prompting the admin to fill it in.
-		profileArn = ""
-	}
 
 	credentials := map[string]any{
 		"access_token":  req.AccessToken,

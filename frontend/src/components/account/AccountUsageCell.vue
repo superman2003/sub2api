@@ -395,6 +395,29 @@
       </div>
     </template>
 
+    <!-- Kiro accounts: show credit usage from account.extra -->
+    <template v-else-if="account.platform === 'kiro'">
+      <div class="space-y-1">
+        <div class="flex items-center gap-1.5">
+          <span class="text-[10px] font-medium text-gray-500 dark:text-gray-400 w-[28px]">Credit</span>
+          <div class="relative h-1.5 flex-1 rounded-full bg-gray-200 dark:bg-gray-700 overflow-hidden">
+            <div
+              :class="[
+                'h-full rounded-full transition-all',
+                kiroCreditPct >= 100 ? 'bg-red-500' :
+                kiroCreditPct >= 80 ? 'bg-yellow-500' :
+                'bg-indigo-500'
+              ]"
+              :style="{ width: Math.min(kiroCreditPct, 100) + '%' }"
+            />
+          </div>
+          <span class="text-[10px] tabular-nums text-gray-600 dark:text-gray-300 w-[60px] text-right">
+            {{ kiroCreditUsed.toFixed(1) }}/{{ kiroCreditLimit }}
+          </span>
+        </div>
+      </div>
+    </template>
+
     <!-- Other accounts: no usage window -->
     <template v-else>
       <div class="text-xs text-gray-400">-</div>
@@ -466,29 +489,6 @@
       <!-- No data at all -->
       <div v-if="!todayStats && !todayStatsLoading && !hasApiKeyQuota" class="text-xs text-gray-400">-</div>
     </div>
-
-    <!-- Kiro accounts: show credit usage from account.extra -->
-    <template v-else-if="account.platform === 'kiro'">
-      <div class="space-y-1">
-        <div class="flex items-center gap-1.5">
-          <span class="text-[10px] font-medium text-gray-500 dark:text-gray-400 w-[28px]">Credit</span>
-          <div class="relative h-1.5 flex-1 rounded-full bg-gray-200 dark:bg-gray-700 overflow-hidden">
-            <div
-              :class="[
-                'h-full rounded-full transition-all',
-                kiroCreditPct >= 100 ? 'bg-red-500' :
-                kiroCreditPct >= 80 ? 'bg-yellow-500' :
-                'bg-indigo-500'
-              ]"
-              :style="{ width: Math.min(kiroCreditPct, 100) + '%' }"
-            />
-          </div>
-          <span class="text-[10px] tabular-nums text-gray-600 dark:text-gray-300 w-[60px] text-right">
-            {{ kiroCreditUsed.toFixed(1) }}/{{ kiroCreditLimit }}
-          </span>
-        </div>
-      </div>
-    </template>
   </div>
 </template>
 

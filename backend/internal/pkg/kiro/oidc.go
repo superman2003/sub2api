@@ -75,6 +75,7 @@ type OIDCTokenResponse struct {
 	RefreshToken string `json:"refreshToken"`
 	TokenType    string `json:"tokenType"`
 	ExpiresIn    int64  `json:"expiresIn"`
+	ProfileArn   string `json:"profileArn"`
 }
 
 // OIDCPollStatus is the non-fatal status returned during polling. When Err is
