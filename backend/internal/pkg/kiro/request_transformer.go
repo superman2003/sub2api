@@ -88,10 +88,34 @@ type AnthropicMessage struct {
 }
 
 // AnthropicTool mirrors a single tool in the Anthropic request.
+//
+// Type distinguishes between user-defined tools (type: "" / "function" / "custom",
+// carry an input_schema) and Anthropic server-side tools (type: "web_search_*",
+// "computer_*", "text_editor_*", "bash_*", ...). Server-side tools are handled
+// by Anthropic infrastructure and carry no JSON schema; Kiro CodeWhisperer does
+// not understand them and rejects the request with "Invalid tool parameters"
+// when they are forwarded verbatim.
 type AnthropicTool struct {
+	Type        string          `json:"type,omitempty"`
 	Name        string          `json:"name"`
 	Description string          `json:"description,omitempty"`
 	InputSchema json.RawMessage `json:"input_schema,omitempty"`
+}
+
+// isUserDefinedTool reports whether a tool is a regular user-defined tool that
+// ships a JSON input_schema and is safe to forward to Kiro CodeWhisperer.
+//
+// Anthropic server-side tool types (web_search_*, computer_*, text_editor_*,
+// bash_*, str_replace_*, code_execution_*, ...) are filtered out because the
+// upstream /generateAssistantResponse endpoint only accepts
+// toolSpecification entries with a concrete inputSchema.json.
+func isUserDefinedTool(t AnthropicTool) bool {
+	switch t.Type {
+	case "", "function", "custom":
+		return true
+	default:
+		return false
+	}
 }
 
 // BuildOptions carries per-request knobs for transformers.
@@ -169,6 +193,14 @@ func BuildKiroPayload(req *AnthropicRequest, opts BuildOptions) (map[string]any,
 	if len(req.Tools) > 0 {
 		kiroTools := make([]any, 0, len(req.Tools))
 		for _, t := range req.Tools {
+			// Drop Anthropic server-side tools (web_search_*, computer_*,
+			// text_editor_*, ...). Kiro CodeWhisperer only accepts user-
+			// defined toolSpecification entries with a concrete inputSchema;
+			// forwarding server-side tools verbatim causes the upstream to
+			// respond with "Invalid tool parameters".
+			if !isUserDefinedTool(t) {
+				continue
+			}
 			var schema any
 			if len(t.InputSchema) > 0 {
 				_ = json.Unmarshal(t.InputSchema, &schema)
@@ -182,7 +214,9 @@ func BuildKiroPayload(req *AnthropicRequest, opts BuildOptions) (map[string]any,
 			}
 			kiroTools = append(kiroTools, map[string]any{"toolSpecification": spec})
 		}
-		userInputContext["tools"] = kiroTools
+		if len(kiroTools) > 0 {
+			userInputContext["tools"] = kiroTools
+		}
 	}
 
 	// Assemble userInputMessage

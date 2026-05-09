@@ -322,6 +322,12 @@ func parsedToKiroAnthropic(p *ParsedRequest) (*kiro.AnthropicRequest, error) {
 				continue
 			}
 			t := kiro.AnthropicTool{}
+			// Preserve the tool discriminator so BuildKiroPayload can filter
+			// out Anthropic server-side tools (web_search_*, computer_*, ...)
+			// that Kiro CodeWhisperer does not understand.
+			if ty, ok := m["type"].(string); ok {
+				t.Type = ty
+			}
 			if n, ok := m["name"].(string); ok {
 				t.Name = n
 			}
