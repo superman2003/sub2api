@@ -475,14 +475,65 @@ func (e *AnthropicSSEEncoder) ContextUsagePct() float64 { return e.contextUsageP
 // MessageID returns the stable message id used in the SSE stream.
 func (e *AnthropicSSEEncoder) MessageID() string { return e.messageID }
 
+// ToolCallInterceptor lets callers intercept a complete tool_use lifecycle
+// (start → deltas → stop) and either let it pass through to the client or
+// replace it with an arbitrary synthetic event stream. Typical use: fulfil
+// Kiro's web_search tool_use server-side via /mcp so the client never sees
+// the tool call — it sees the search result as regular assistant text.
+//
+// The interceptor is consulted exactly once per tool_use lifecycle. When
+// OnToolStart returns handled=true, the gateway buffers the whole
+// lifecycle (start + any deltas + stop) until stop arrives, then asks
+// OnToolStop to produce the replacement events. If OnToolStart returns
+// handled=false, the events pass straight through to the encoder as usual.
+type ToolCallInterceptor interface {
+	// OnToolStart is called when a tool_use_start event is observed. It
+	// should quickly decide whether to intercept (buffer) this tool call.
+	OnToolStart(ctx context.Context, start *StreamEvent) (handled bool)
+	// OnToolStop is called once the matching tool_use_stop arrives, with
+	// the full concatenated input string. The returned events are emitted
+	// in order; returning a nil slice drops the tool call entirely.
+	OnToolStop(ctx context.Context, toolUseID, toolName, input string) ([]*StreamEvent, error)
+}
+
 // DriveEventStreamToAnthropic reads EventStream frames from r, converts them
 // through ParseEventStreamFrame, and drives the encoder until the stream ends.
 //
 // Returns accumulated text (for non-stream use cases) and any error other than
 // io.EOF.
 func DriveEventStreamToAnthropic(ctx context.Context, r io.Reader, enc *AnthropicSSEEncoder) (string, error) {
+	return DriveEventStreamToAnthropicWithInterceptor(ctx, r, enc, nil)
+}
+
+// DriveEventStreamToAnthropicWithInterceptor is the same as
+// DriveEventStreamToAnthropic but lets the caller plug in a tool-call
+// interceptor. Pass nil to get the default pass-through behaviour.
+func DriveEventStreamToAnthropicWithInterceptor(
+	ctx context.Context,
+	r io.Reader,
+	enc *AnthropicSSEEncoder,
+	interceptor ToolCallInterceptor,
+) (string, error) {
 	reader := NewEventStreamReader(r)
 	var textBuf bytes.Buffer
+
+	// Per-intercepted-tool buffer: tool_use_start + its deltas are held
+	// here until tool_use_stop is observed, at which point the interceptor
+	// decides what to emit.
+	type pendingTool struct {
+		name   string
+		input  strings.Builder
+		active bool
+	}
+	pending := make(map[string]*pendingTool)
+
+	emit := func(ev *StreamEvent) error {
+		if ev.Kind == "content" {
+			textBuf.WriteString(ev.Text)
+		}
+		return enc.Emit(ev)
+	}
+
 	for {
 		if ctx.Err() != nil {
 			return textBuf.String(), ctx.Err()
@@ -501,10 +552,54 @@ func DriveEventStreamToAnthropic(ctx context.Context, r io.Reader, enc *Anthropi
 		if ev == nil {
 			continue
 		}
-		if ev.Kind == "content" {
-			textBuf.WriteString(ev.Text)
+
+		// Interceptor hook: buffer tool_use events of interest until stop.
+		if interceptor != nil {
+			switch ev.Kind {
+			case "tool_use_start":
+				if interceptor.OnToolStart(ctx, ev) {
+					p := &pendingTool{name: ev.ToolName, active: true}
+					if ev.ToolInput != "" {
+						p.input.WriteString(ev.ToolInput)
+					}
+					pending[ev.ToolUseID] = p
+					continue
+				}
+			case "tool_use_delta":
+				if p, ok := pending[ev.ToolUseID]; ok && p.active {
+					p.input.WriteString(ev.ToolDelta)
+					continue
+				}
+			case "tool_use_stop":
+				if p, ok := pending[ev.ToolUseID]; ok && p.active {
+					delete(pending, ev.ToolUseID)
+					replacement, ierr := interceptor.OnToolStop(ctx, ev.ToolUseID, p.name, p.input.String())
+					if ierr != nil {
+						// Surface interceptor errors as stream errors;
+						// the encoder handles the SSE framing.
+						if eerr := emit(&StreamEvent{
+							Kind:         "error",
+							ErrorType:    "tool_interceptor_error",
+							ErrorMessage: ierr.Error(),
+						}); eerr != nil {
+							return textBuf.String(), eerr
+						}
+						continue
+					}
+					for _, rep := range replacement {
+						if rep == nil {
+							continue
+						}
+						if eerr := emit(rep); eerr != nil {
+							return textBuf.String(), eerr
+						}
+					}
+					continue
+				}
+			}
 		}
-		if err := enc.Emit(ev); err != nil {
+
+		if err := emit(ev); err != nil {
 			return textBuf.String(), err
 		}
 	}

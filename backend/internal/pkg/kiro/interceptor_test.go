@@ -1,0 +1,159 @@
+package kiro
+
+import (
+	"bytes"
+	"context"
+	"encoding/binary"
+	"encoding/json"
+	"hash/crc32"
+	"testing"
+
+	"github.com/stretchr/testify/require"
+)
+
+// fakeInterceptor is a stub ToolCallInterceptor used to verify that
+// DriveEventStreamToAnthropicWithInterceptor hides the intercepted tool_use
+// lifecycle from the encoder and emits replacement events instead.
+type fakeInterceptor struct {
+	matchName  string
+	seenInput  string
+	replaceTxt string
+}
+
+func (f *fakeInterceptor) OnToolStart(_ context.Context, ev *StreamEvent) bool {
+	return ev != nil && ev.ToolName == f.matchName
+}
+
+func (f *fakeInterceptor) OnToolStop(_ context.Context, _, _ string, input string) ([]*StreamEvent, error) {
+	f.seenInput = input
+	return []*StreamEvent{{Kind: "content", Text: f.replaceTxt}}, nil
+}
+
+// TestDriveEventStream_InterceptorSwallowsToolUseAndSubstitutesText verifies
+// that when a tool_use lifecycle is intercepted, the encoder never sees any
+// content_block_start/delta/stop frames for the tool — only the replacement
+// text event is forwarded.
+func TestDriveEventStream_InterceptorSwallowsToolUseAndSubstitutesText(t *testing.T) {
+	stream := concat(
+		testFrameJSON("assistantResponseEvent", map[string]any{"content": "Let me search."}),
+		testFrameJSON("toolUseEvent", map[string]any{
+			"toolUseId": "t1", "name": "web_search", "input": `{"query":"`,
+		}),
+		testFrameJSON("toolUseEvent", map[string]any{
+			"toolUseId": "t1", "input": `kiro"}`,
+		}),
+		testFrameJSON("toolUseEvent", map[string]any{
+			"toolUseId": "t1", "stop": true,
+		}),
+		testFrameJSON("assistantResponseEvent", map[string]any{"content": "Done."}),
+	)
+
+	var out bytes.Buffer
+	enc := NewAnthropicSSEEncoder(&out, nil, "claude-sonnet-4.5")
+
+	interceptor := &fakeInterceptor{matchName: "web_search", replaceTxt: "[search results]"}
+	text, err := DriveEventStreamToAnthropicWithInterceptor(
+		context.Background(), bytes.NewReader(stream), enc, interceptor,
+	)
+	require.NoError(t, err)
+	require.NoError(t, enc.Finish("end_turn"))
+
+	require.Equal(t, `{"query":"kiro"}`, interceptor.seenInput,
+		"interceptor must receive reassembled tool input JSON")
+
+	require.Contains(t, text, "Let me search.")
+	require.Contains(t, text, "[search results]")
+	require.Contains(t, text, "Done.")
+
+	sse := out.String()
+	require.NotContains(t, sse, `"type":"tool_use"`,
+		"tool_use block leaked to client SSE")
+	require.NotContains(t, sse, "input_json_delta",
+		"partial_json leaked to client SSE")
+	require.Contains(t, sse, "[search results]")
+}
+
+// TestDriveEventStream_NonMatchingInterceptorPassesThrough verifies that
+// when the interceptor returns handled=false, the tool_use lifecycle is
+// emitted to the client unchanged.
+func TestDriveEventStream_NonMatchingInterceptorPassesThrough(t *testing.T) {
+	stream := concat(
+		testFrameJSON("toolUseEvent", map[string]any{
+			"toolUseId": "t9", "name": "read_file", "input": `{"path":"/tmp"}`,
+		}),
+		testFrameJSON("toolUseEvent", map[string]any{
+			"toolUseId": "t9", "stop": true,
+		}),
+	)
+
+	var out bytes.Buffer
+	enc := NewAnthropicSSEEncoder(&out, nil, "claude-sonnet-4.5")
+
+	interceptor := &fakeInterceptor{matchName: "web_search", replaceTxt: "SHOULD NOT APPEAR"}
+	_, err := DriveEventStreamToAnthropicWithInterceptor(
+		context.Background(), bytes.NewReader(stream), enc, interceptor,
+	)
+	require.NoError(t, err)
+	require.NoError(t, enc.Finish("end_turn"))
+
+	sse := out.String()
+	require.Contains(t, sse, `"type":"tool_use"`,
+		"non-matching tool_use should pass through")
+	require.Contains(t, sse, `"name":"read_file"`)
+	require.NotContains(t, sse, "SHOULD NOT APPEAR")
+}
+
+// --- Helpers ---
+
+// testFrameJSON encodes a single AWS EventStream frame with the standard
+// two headers (:message-type="event", :event-type=<t>) and a JSON payload.
+// Kept inline (rather than shared with eventstream_test.go) so this test
+// file does not need the `unit` build tag.
+func testFrameJSON(eventType string, payload any) []byte {
+	raw, _ := json.Marshal(payload)
+	return testBuildEventStreamFrame(map[string]string{
+		":message-type": "event",
+		":event-type":   eventType,
+		":content-type": "application/json",
+	}, raw)
+}
+
+func testBuildEventStreamFrame(headers map[string]string, payload []byte) []byte {
+	var hbuf bytes.Buffer
+	for name, value := range headers {
+		hbuf.WriteByte(byte(len(name)))
+		hbuf.WriteString(name)
+		hbuf.WriteByte(0x07) // string header type
+		var lb [2]byte
+		binary.BigEndian.PutUint16(lb[:], uint16(len(value)))
+		hbuf.Write(lb[:])
+		hbuf.WriteString(value)
+	}
+
+	hraw := hbuf.Bytes()
+	totalLen := uint32(12 + len(hraw) + len(payload) + 4)
+	headersLen := uint32(len(hraw))
+
+	var prelude [8]byte
+	binary.BigEndian.PutUint32(prelude[0:4], totalLen)
+	binary.BigEndian.PutUint32(prelude[4:8], headersLen)
+	preludeCRC := crc32.ChecksumIEEE(prelude[:])
+
+	var out bytes.Buffer
+	out.Write(prelude[:])
+	_ = binary.Write(&out, binary.BigEndian, preludeCRC)
+	out.Write(hraw)
+	out.Write(payload)
+
+	msgCRC := crc32.ChecksumIEEE(out.Bytes())
+	_ = binary.Write(&out, binary.BigEndian, msgCRC)
+	return out.Bytes()
+}
+
+func concat(chunks ...[]byte) []byte {
+	var buf bytes.Buffer
+	for _, c := range chunks {
+		buf.Write(c)
+	}
+	return buf.Bytes()
+}

@@ -207,7 +207,15 @@ func (s *KiroGatewayService) Forward(
 	}
 
 	encoder := kiro.NewAnthropicSSEEncoder(c.Writer, flush, parsed.Model)
-	text, err := kiro.DriveEventStreamToAnthropic(forwardCtx, resp.Body, encoder)
+
+	// Install the web_search interceptor: when the Kiro model invokes the
+	// synthetic `web_search` function tool (rewritten from an Anthropic
+	// server-side web_search_* entry by the request transformer), the
+	// interceptor calls Kiro's /mcp endpoint using the account's own
+	// bearer token and replaces the tool_use SSE with plain assistant text.
+	// No third-party API key is required.
+	interceptor := newKiroWebSearchInterceptor(forwardCtx, client, token, profileArn)
+	text, err := kiro.DriveEventStreamToAnthropicWithInterceptor(forwardCtx, resp.Body, encoder, interceptor)
 	if err != nil && !errors.Is(err, context.Canceled) {
 		// Stream already started; emit an error event so the client can fail gracefully.
 		_ = encoder.Emit(&kiro.StreamEvent{Kind: "error", ErrorType: "upstream_error", ErrorMessage: err.Error()})

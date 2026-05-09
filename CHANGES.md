@@ -28,15 +28,36 @@ This fork adds **Kiro platform support** (Amazon Q Developer / CodeWhisperer) an
 ### Kiro WebSearch Unblocking (Claude Code → Kiro "Invalid tool parameters")
 - `AnthropicTool` now preserves the `type` field so server-side Anthropic tools
   (`web_search_20250305`, `computer_20250124`, `text_editor_20250124`, ...)
-  can be detected and filtered before being forwarded to CodeWhisperer.
+  can be detected and handled before being forwarded to CodeWhisperer.
   Previously the missing discriminator caused Kiro upstream to reject every
   Claude Code session with "Invalid tool parameters" because the CLI ships
   a `WebSearch` server-side tool by default.
-- `BuildKiroPayload` skips server-side tools when emitting
-  `toolSpecification` entries; if every tool is filtered, the whole
-  `tools` array is omitted instead of sent as `[]`.
-- Unit tests cover the user-defined vs server-side classification and the
-  no-op-on-all-filtered scenario.
+- **`BuildKiroPayload` now rewrites** any Anthropic server-side
+  `web_search_*` tool into a plain function tool (`name: "web_search"`,
+  with a synthesised JSON Schema) so the Kiro model can actually invoke it.
+- Other server-side tools (`computer_*`, `text_editor_*`, `bash_*`, ...) are
+  still dropped because Kiro CodeWhisperer has no equivalent.
+- If every submitted tool is dropped, the whole `tools` array is omitted
+  instead of sent as `[]`.
+
+### Kiro Native WebSearch (Zero-config, uses the account's own /mcp endpoint)
+- Added `kiro.CallMCPWebSearch` which performs a JSON-RPC 2.0 `tools/call`
+  against Kiro's own `/mcp` endpoint
+  (`https://q.<region>.amazonaws.com/mcp`), using the caller's existing
+  Kiro bearer token. Region is parsed from the account's `profileArn`,
+  falling back to `us-east-1`.
+- Added `DriveEventStreamToAnthropicWithInterceptor` so the response
+  transformer can hook into a tool_use lifecycle. The new
+  `kiroWebSearchInterceptor` swallows the `web_search` tool_use events
+  (they never reach the client) and replaces them with a plain
+  `<web_search>...</web_search>` text block containing formatted results.
+- End result: Claude Code's WebSearch now works out of the box against a
+  Kiro account. No third-party API key, no Brave/Tavily setup, no settings
+  to flip. Mirrors the behaviour Kiro IDE exposes natively.
+- Tests: unit coverage for MCP JSON-RPC encoding/decoding, region
+  extraction, summary formatting, query extraction from partial JSON, and
+  an end-to-end flow verifying the interceptor fully hides tool_use from
+  the client SSE while preserving surrounding assistant text.
 
 ### Kiro WebSearch Emulation (third-party provider path)
 - `GetWebSearchEmulationMode` now allows **Kiro** accounts to participate in

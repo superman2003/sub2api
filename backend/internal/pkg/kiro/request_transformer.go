@@ -102,20 +102,52 @@ type AnthropicTool struct {
 	InputSchema json.RawMessage `json:"input_schema,omitempty"`
 }
 
-// isUserDefinedTool reports whether a tool is a regular user-defined tool that
-// ships a JSON input_schema and is safe to forward to Kiro CodeWhisperer.
-//
-// Anthropic server-side tool types (web_search_*, computer_*, text_editor_*,
-// bash_*, str_replace_*, code_execution_*, ...) are filtered out because the
-// upstream /generateAssistantResponse endpoint only accepts
-// toolSpecification entries with a concrete inputSchema.json.
-func isUserDefinedTool(t AnthropicTool) bool {
-	switch t.Type {
-	case "", "function", "custom":
-		return true
-	default:
-		return false
+// builtinKiroWebSearchToolName is the name used when the gateway rewrites
+// an Anthropic server-side web_search_* tool into a regular function tool
+// that Kiro CodeWhisperer can actually invoke. The name is chosen to be
+// identical to what the Anthropic protocol uses ("web_search") so when the
+// response transformer intercepts the tool call and reports it back to
+// the client, the client sees the tool name it originally sent.
+const builtinKiroWebSearchToolName = "web_search"
+
+// defaultWebSearchDescription is surfaced to the Kiro model when the
+// gateway synthesises a tool specification from an Anthropic server-side
+// web_search_* entry that had no description of its own.
+const defaultWebSearchDescription = "Search the public web. Use this when you need up-to-date information that is outside your training data. The tool accepts a single 'query' argument; respond with a concise query string."
+
+// defaultWebSearchInputSchema is injected when rewriting an Anthropic
+// server-side web_search_* tool into a Kiro function tool. Kiro requires a
+// concrete JSON Schema on every toolSpecification.
+var defaultWebSearchInputSchema = json.RawMessage(
+	`{"type":"object","properties":{"query":{"type":"string","description":"Search query"}},"required":["query"],"additionalProperties":false}`,
+)
+
+// isAnthropicServerSideWebSearch reports whether the tool entry is the
+// Anthropic server-side web_search_* variant that Kiro cannot execute
+// natively. When true, the caller rewrites the entry into a function tool
+// so the model can still trigger a search, and the gateway fulfils it by
+// calling Kiro's /mcp endpoint instead.
+func isAnthropicServerSideWebSearch(t AnthropicTool) bool {
+	if t.Type == "" {
+		// Legacy shape where only the name is meaningful.
+		return t.Name == "web_search" && len(t.InputSchema) == 0
 	}
+	return strings.HasPrefix(t.Type, "web_search")
+}
+
+// rewriteToFunctionWebSearch normalises an Anthropic server-side web_search
+// tool into a plain function tool that Kiro will invoke.
+func rewriteToFunctionWebSearch(t AnthropicTool) AnthropicTool {
+	out := t
+	out.Type = "function"
+	out.Name = builtinKiroWebSearchToolName
+	if strings.TrimSpace(out.Description) == "" {
+		out.Description = defaultWebSearchDescription
+	}
+	if len(out.InputSchema) == 0 {
+		out.InputSchema = defaultWebSearchInputSchema
+	}
+	return out
 }
 
 // BuildOptions carries per-request knobs for transformers.
@@ -193,12 +225,20 @@ func BuildKiroPayload(req *AnthropicRequest, opts BuildOptions) (map[string]any,
 	if len(req.Tools) > 0 {
 		kiroTools := make([]any, 0, len(req.Tools))
 		for _, t := range req.Tools {
-			// Drop Anthropic server-side tools (web_search_*, computer_*,
-			// text_editor_*, ...). Kiro CodeWhisperer only accepts user-
-			// defined toolSpecification entries with a concrete inputSchema;
-			// forwarding server-side tools verbatim causes the upstream to
-			// respond with "Invalid tool parameters".
-			if !isUserDefinedTool(t) {
+			switch {
+			case isAnthropicServerSideWebSearch(t):
+				// Rewrite into a plain function tool so Kiro's model will
+				// actually invoke it. The response transformer will
+				// intercept the tool_use event and fulfil it via Kiro's
+				// /mcp endpoint.
+				t = rewriteToFunctionWebSearch(t)
+			case t.Type != "" && t.Type != "function" && t.Type != "custom":
+				// Drop other Anthropic server-side tools (computer_*,
+				// text_editor_*, bash_*, ...). Kiro CodeWhisperer only
+				// accepts user-defined toolSpecification entries with a
+				// concrete inputSchema; forwarding server-side tools
+				// verbatim causes the upstream to respond with "Invalid
+				// tool parameters".
 				continue
 			}
 			var schema any
