@@ -466,6 +466,29 @@
       <!-- No data at all -->
       <div v-if="!todayStats && !todayStatsLoading && !hasApiKeyQuota" class="text-xs text-gray-400">-</div>
     </div>
+
+    <!-- Kiro accounts: show credit usage from account.extra -->
+    <template v-else-if="account.platform === 'kiro'">
+      <div class="space-y-1">
+        <div class="flex items-center gap-1.5">
+          <span class="text-[10px] font-medium text-gray-500 dark:text-gray-400 w-[28px]">Credit</span>
+          <div class="relative h-1.5 flex-1 rounded-full bg-gray-200 dark:bg-gray-700 overflow-hidden">
+            <div
+              :class="[
+                'h-full rounded-full transition-all',
+                kiroCreditPct >= 100 ? 'bg-red-500' :
+                kiroCreditPct >= 80 ? 'bg-yellow-500' :
+                'bg-indigo-500'
+              ]"
+              :style="{ width: Math.min(kiroCreditPct, 100) + '%' }"
+            />
+          </div>
+          <span class="text-[10px] tabular-nums text-gray-600 dark:text-gray-300 w-[60px] text-right">
+            {{ kiroCreditUsed.toFixed(1) }}/{{ kiroCreditLimit }}
+          </span>
+        </div>
+      </div>
+    </template>
   </div>
 </template>
 
@@ -524,7 +547,25 @@ let visibilityObserver: IntersectionObserver | null = null
 const showUsageWindows = computed(() => {
   // Gemini: we can always compute local usage windows from DB logs (simulated quotas).
   if (props.account.platform === 'gemini') return true
+  // Kiro: show credit usage from account.extra (no API fetch needed).
+  if (props.account.platform === 'kiro') return true
   return props.account.type === 'oauth' || props.account.type === 'setup-token'
+})
+
+// Kiro credit usage (read directly from account.extra, no API call needed)
+const kiroCreditUsed = computed(() => {
+  const extra = props.account.extra as Record<string, unknown> | undefined
+  const v = extra?.kiro_credit_used
+  return typeof v === 'number' ? v : 0
+})
+const kiroCreditLimit = computed(() => {
+  const extra = props.account.extra as Record<string, unknown> | undefined
+  const v = extra?.kiro_credit_limit
+  return typeof v === 'number' && v > 0 ? v : 1000
+})
+const kiroCreditPct = computed(() => {
+  if (kiroCreditLimit.value <= 0) return 0
+  return (kiroCreditUsed.value / kiroCreditLimit.value) * 100
 })
 
 const shouldFetchUsage = computed(() => {

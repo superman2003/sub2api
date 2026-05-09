@@ -8401,6 +8401,12 @@ func (s *GatewayService) recordUsageCore(ctx context.Context, input *recordUsage
 	// 计算费用
 	cost := s.calculateRecordUsageCost(ctx, result, apiKey, billingModel, multiplier, imageMultiplier, opts)
 
+	// Kiro credit 累加：将本次消耗的 credit 原子累加到 account.extra.kiro_credit_used
+	// 用于前端展示"已用积分 / 总积分(1000)"进度条。
+	if result.KiroMeteringCredit > 0 && account != nil && account.Platform == PlatformKiro {
+		s.accumulateKiroCreditUsed(ctx, account.ID, result.KiroMeteringCredit)
+	}
+
 	// 判断计费方式：订阅模式 vs 余额模式
 	isSubscriptionBilling := subscription != nil && apiKey.Group != nil && apiKey.Group.IsSubscriptionType()
 	billingType := BillingTypeBalance
