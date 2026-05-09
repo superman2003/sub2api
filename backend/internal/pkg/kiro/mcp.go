@@ -119,7 +119,10 @@ func CallMCPWebSearch(
 	if err := json.NewDecoder(resp.Body).Decode(&env); err != nil {
 		return nil, fmt.Errorf("kiro mcp: decode envelope: %w", err)
 	}
-	if len(env.Error) > 0 {
+	// `error` may legitimately be JSON null, which comes through as a
+	// 4-byte raw message ("null"). Treat only explicit, non-null error
+	// payloads as failures.
+	if len(env.Error) > 0 && string(env.Error) != "null" {
 		return nil, fmt.Errorf("kiro mcp: jsonrpc error: %s", string(env.Error))
 	}
 	if env.Result == nil || len(env.Result.Content) == 0 {

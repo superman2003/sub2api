@@ -45,19 +45,39 @@ This fork adds **Kiro platform support** (Amazon Q Developer / CodeWhisperer) an
   against Kiro's own `/mcp` endpoint
   (`https://q.<region>.amazonaws.com/mcp`), using the caller's existing
   Kiro bearer token. Region is parsed from the account's `profileArn`,
-  falling back to `us-east-1`.
+  falling back to `us-east-1`. Correctly treats `"error": null` (which
+  Kiro returns on every successful call) as success.
 - Added `DriveEventStreamToAnthropicWithInterceptor` so the response
-  transformer can hook into a tool_use lifecycle. The new
-  `kiroWebSearchInterceptor` swallows the `web_search` tool_use events
-  (they never reach the client) and replaces them with a plain
-  `<web_search>...</web_search>` text block containing formatted results.
+  transformer can hook into a tool_use lifecycle. The driver normalises
+  Kiro's wire quirk where every `toolUseEvent` frame re-carries the tool
+  name (treated as tool_use_start on the first frame, tool_use_delta
+  afterwards) and flushes any pending interceptor lifecycle on EOF even
+  without an explicit stop frame.
+- `kiroWebSearchInterceptor` catches both `web_search` (lowercase,
+  injected by the request transformer from Anthropic server-side entries)
+  and `WebSearch` (the function-shape tool Claude Code CLI ships by
+  default). On match it:
+    1. Calls Kiro `/mcp` with the account's bearer token.
+    2. Launches a **second** `/generateAssistantResponse` turn whose
+       history includes a synthetic `tool_use` + `tool_result` pair
+       carrying the MCP output.
+    3. Streams the model's natural-language summary back to the client
+       as regular assistant text.
+  The original `tool_use` SSE never reaches the client, so Claude Code
+  sees WebSearch behave like a proper server-side tool. Falls back to the
+  raw `FormatSearchSummary` output when the follow-up turn fails.
 - End result: Claude Code's WebSearch now works out of the box against a
   Kiro account. No third-party API key, no Brave/Tavily setup, no settings
-  to flip. Mirrors the behaviour Kiro IDE exposes natively.
-- Tests: unit coverage for MCP JSON-RPC encoding/decoding, region
-  extraction, summary formatting, query extraction from partial JSON, and
-  an end-to-end flow verifying the interceptor fully hides tool_use from
-  the client SSE while preserving surrounding assistant text.
+  to flip. The model writes a summary of the search results instead of
+  dumping the raw list at the user.
+- Opt-in debug: set `SUB2API_KIRO_DEBUG_DUMP=1` to dump every incoming
+  Kiro request body to `%TEMP%/sub2api-kiro-dumps/`. Useful when tracing
+  new client-side tool shapes.
+- Tests: unit coverage for MCP JSON-RPC encoding/decoding (including the
+  `"error": null` case), region extraction, summary formatting, query
+  extraction from partial JSON, and three end-to-end scenarios on the
+  stream driver — basic interception, multi-frame start accumulation,
+  and EOF-without-stop flush.
 
 ### Kiro WebSearch Emulation (third-party provider path)
 - `GetWebSearchEmulationMode` now allows **Kiro** accounts to participate in

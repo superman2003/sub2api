@@ -483,17 +483,18 @@ func (e *AnthropicSSEEncoder) MessageID() string { return e.messageID }
 //
 // The interceptor is consulted exactly once per tool_use lifecycle. When
 // OnToolStart returns handled=true, the gateway buffers the whole
-// lifecycle (start + any deltas + stop) until stop arrives, then asks
-// OnToolStop to produce the replacement events. If OnToolStart returns
-// handled=false, the events pass straight through to the encoder as usual.
+// lifecycle (start + any deltas + stop) until stop arrives, then calls
+// OnToolStop. The interceptor uses the provided emit callback to stream
+// any number of replacement events; returning nil without emitting drops
+// the tool call entirely.
 type ToolCallInterceptor interface {
 	// OnToolStart is called when a tool_use_start event is observed. It
 	// should quickly decide whether to intercept (buffer) this tool call.
 	OnToolStart(ctx context.Context, start *StreamEvent) (handled bool)
 	// OnToolStop is called once the matching tool_use_stop arrives, with
-	// the full concatenated input string. The returned events are emitted
-	// in order; returning a nil slice drops the tool call entirely.
-	OnToolStop(ctx context.Context, toolUseID, toolName, input string) ([]*StreamEvent, error)
+	// the full concatenated input string. Events are sent to the client
+	// via emit; returning an error surfaces it as a stream-level error.
+	OnToolStop(ctx context.Context, toolUseID, toolName, input string, emit func(*StreamEvent) error) error
 }
 
 // DriveEventStreamToAnthropic reads EventStream frames from r, converts them
@@ -527,6 +528,15 @@ func DriveEventStreamToAnthropicWithInterceptor(
 	}
 	pending := make(map[string]*pendingTool)
 
+	// Kiro's wire format emits every toolUseEvent frame with the same
+	// `name` field populated, even though only the first one is a real
+	// "start" and subsequent ones are partial-input continuations
+	// (the reference kiro-gateway Python implementation handles this the
+	// same way in parsers.py). We track which toolUseIds we've already
+	// started so we can demote later frames from tool_use_start to
+	// tool_use_delta before downstream logic runs.
+	seenStarts := make(map[string]struct{})
+
 	emit := func(ev *StreamEvent) error {
 		if ev.Kind == "content" {
 			textBuf.WriteString(ev.Text)
@@ -541,6 +551,25 @@ func DriveEventStreamToAnthropicWithInterceptor(
 		msg, err := reader.Next()
 		if err != nil {
 			if errors.Is(err, io.EOF) {
+				// Flush any intercepted tool_use lifecycles that did not
+				// receive an explicit stop frame. Kiro's streaming format
+				// does not always emit a trailing stop so we finalise
+				// here to avoid silent truncation.
+				if interceptor != nil {
+					for id, p := range pending {
+						if !p.active {
+							continue
+						}
+						delete(pending, id)
+						if ierr := interceptor.OnToolStop(ctx, id, p.name, p.input.String(), emit); ierr != nil {
+							_ = emit(&StreamEvent{
+								Kind:         "error",
+								ErrorType:    "tool_interceptor_error",
+								ErrorMessage: ierr.Error(),
+							})
+						}
+					}
+				}
 				return textBuf.String(), nil
 			}
 			return textBuf.String(), err
@@ -551,6 +580,25 @@ func DriveEventStreamToAnthropicWithInterceptor(
 		}
 		if ev == nil {
 			continue
+		}
+
+		// Normalise Kiro's repeated tool_use_start frames: keep the first
+		// one (real start), convert the rest into tool_use_delta carrying
+		// the same input fragment, so downstream code handles them as
+		// continuations.
+		if ev.Kind == "tool_use_start" {
+			if _, already := seenStarts[ev.ToolUseID]; already {
+				ev = &StreamEvent{
+					Kind:      "tool_use_delta",
+					ToolUseID: ev.ToolUseID,
+					ToolDelta: ev.ToolInput,
+				}
+			} else {
+				seenStarts[ev.ToolUseID] = struct{}{}
+			}
+		} else if ev.Kind == "tool_use_stop" {
+			// Once the tool finishes we no longer need to remember it.
+			delete(seenStarts, ev.ToolUseID)
 		}
 
 		// Interceptor hook: buffer tool_use events of interest until stop.
@@ -573,24 +621,12 @@ func DriveEventStreamToAnthropicWithInterceptor(
 			case "tool_use_stop":
 				if p, ok := pending[ev.ToolUseID]; ok && p.active {
 					delete(pending, ev.ToolUseID)
-					replacement, ierr := interceptor.OnToolStop(ctx, ev.ToolUseID, p.name, p.input.String())
-					if ierr != nil {
-						// Surface interceptor errors as stream errors;
-						// the encoder handles the SSE framing.
+					if ierr := interceptor.OnToolStop(ctx, ev.ToolUseID, p.name, p.input.String(), emit); ierr != nil {
 						if eerr := emit(&StreamEvent{
 							Kind:         "error",
 							ErrorType:    "tool_interceptor_error",
 							ErrorMessage: ierr.Error(),
 						}); eerr != nil {
-							return textBuf.String(), eerr
-						}
-						continue
-					}
-					for _, rep := range replacement {
-						if rep == nil {
-							continue
-						}
-						if eerr := emit(rep); eerr != nil {
 							return textBuf.String(), eerr
 						}
 					}

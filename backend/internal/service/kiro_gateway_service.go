@@ -8,9 +8,12 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"net/http"
 	"net/url"
+	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -18,6 +21,7 @@ import (
 	"github.com/Wei-Shaw/sub2api/internal/pkg/proxyurl"
 
 	"github.com/gin-gonic/gin"
+	"github.com/tidwall/gjson"
 )
 
 // kiroUpstreamEndpoint is the Amazon CodeWhisperer endpoint used by the Kiro
@@ -208,13 +212,25 @@ func (s *KiroGatewayService) Forward(
 
 	encoder := kiro.NewAnthropicSSEEncoder(c.Writer, flush, parsed.Model)
 
-	// Install the web_search interceptor: when the Kiro model invokes the
-	// synthetic `web_search` function tool (rewritten from an Anthropic
-	// server-side web_search_* entry by the request transformer), the
-	// interceptor calls Kiro's /mcp endpoint using the account's own
-	// bearer token and replaces the tool_use SSE with plain assistant text.
-	// No third-party API key is required.
-	interceptor := newKiroWebSearchInterceptor(forwardCtx, client, token, profileArn)
+	// Install the web_search interceptor: when the Kiro model invokes
+	// `WebSearch` / `web_search`, the interceptor runs the search via
+	// Kiro's /mcp endpoint and then launches a follow-up
+	// /generateAssistantResponse turn whose history includes the synthetic
+	// tool_result. The model's natural-language summary is streamed back
+	// to the client; the underlying tool_use never leaks.
+	interceptor := newKiroWebSearchInterceptor(
+		forwardCtx,
+		client,
+		token,
+		anthropicReq,
+		kiro.BuildOptions{
+			ProfileArn:     profileArn,
+			ModelMapping:   mapping,
+			ConversationID: conversationIDFromContext(c),
+		},
+		kiroUpstreamEndpoint,
+		kiroUpstreamHeaders(token),
+	)
 	text, err := kiro.DriveEventStreamToAnthropicWithInterceptor(forwardCtx, resp.Body, encoder, interceptor)
 	if err != nil && !errors.Is(err, context.Canceled) {
 		// Stream already started; emit an error event so the client can fail gracefully.
@@ -336,6 +352,29 @@ func parsedToKiroAnthropic(p *ParsedRequest) (*kiro.AnthropicRequest, error) {
 		return nil, fmt.Errorf("unmarshal parsed body: %w", err)
 	}
 
+	// Opt-in body dump: when SUB2API_KIRO_DEBUG_DUMP is set the incoming
+	// Kiro request body is written to disk as a JSON file for triage.
+	// Tool names are not secrets; payload may still contain conversation
+	// data so this stays gated by an explicit env flag.
+	if os.Getenv("SUB2API_KIRO_DEBUG_DUMP") != "" {
+		dumpDir := os.Getenv("SUB2API_KIRO_DEBUG_DUMP_DIR")
+		if dumpDir == "" {
+			dumpDir = filepath.Join(os.TempDir(), "sub2api-kiro-dumps")
+		}
+		if err := os.MkdirAll(dumpDir, 0o755); err == nil {
+			name := fmt.Sprintf("req-%d.json", time.Now().UnixNano())
+			if werr := os.WriteFile(filepath.Join(dumpDir, name), p.Body, 0o600); werr != nil {
+				slog.Warn("kiro debug dump failed", "error", werr)
+			} else {
+				slog.Info("kiro debug dump written",
+					"file", filepath.Join(dumpDir, name),
+					"body_bytes", len(p.Body),
+					"tools_count", gjson.GetBytes(p.Body, "tools.#").Int(),
+				)
+			}
+		}
+	}
+
 	req := &kiro.AnthropicRequest{
 		Model:  p.Model,
 		Stream: p.Stream,
@@ -395,8 +434,30 @@ func parsedToKiroAnthropic(p *ParsedRequest) (*kiro.AnthropicRequest, error) {
 			tools = append(tools, t)
 		}
 		req.Tools = tools
+
+		// Tool summary (Debug-level): lets operators confirm what arrived
+		// from the client. Safe to log — tool names are not secrets.
+		if len(tools) > 0 {
+			slog.Debug("kiro gateway: incoming tools",
+				"count", len(tools), "tools", summariseTools(tools))
+		}
 	}
 	return req, nil
+}
+
+// summariseTools compresses tool metadata into a log-friendly slice. Kept
+// small and allocation-free beyond what the caller already built.
+func summariseTools(tools []kiro.AnthropicTool) []map[string]any {
+	out := make([]map[string]any, 0, len(tools))
+	for _, t := range tools {
+		out = append(out, map[string]any{
+			"name":        t.Name,
+			"type":        t.Type,
+			"has_schema":  len(t.InputSchema) > 0,
+			"schema_size": len(t.InputSchema),
+		})
+	}
+	return out
 }
 
 // kiroModelMappingForAccount resolves the effective Anthropic -> Kiro model

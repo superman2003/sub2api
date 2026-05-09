@@ -129,6 +129,32 @@ func TestCallMCPWebSearch_RejectsEmptyInputs(t *testing.T) {
 	require.Error(t, err)
 }
 
+// TestCallMCPWebSearch_NullErrorIsNotAnError verifies that a JSON-RPC
+// response with explicit `"error": null` is treated as success. Kiro's
+// real /mcp endpoint uses this shape on every successful call.
+func TestCallMCPWebSearch_NullErrorIsNotAnError(t *testing.T) {
+	innerPayload := `{"query":"q","totalResults":0,"results":[]}`
+	outer := map[string]any{
+		"id":      "stub",
+		"jsonrpc": "2.0",
+		"error":   nil, // marshalled as JSON null
+		"result": map[string]any{
+			"isError": false,
+			"content": []map[string]string{{"type": "text", "text": innerPayload}},
+		},
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(outer)
+	}))
+	defer server.Close()
+
+	client := &http.Client{Transport: rewriteHostTransport{to: server.URL}}
+	resp, err := CallMCPWebSearch(context.Background(), client, "us-east-1", "t", "q")
+	require.NoError(t, err)
+	require.Equal(t, "q", resp.Query)
+}
+
 // rewriteHostTransport replaces the outgoing request's scheme+host with `to`
 // so tests can point CallMCPWebSearch at an httptest server without mocking
 // the URL template itself.

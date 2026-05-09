@@ -3,6 +3,7 @@ package kiro
 import (
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"strings"
 
 	"github.com/google/uuid"
@@ -224,6 +225,7 @@ func BuildKiroPayload(req *AnthropicRequest, opts BuildOptions) (map[string]any,
 	userInputContext := map[string]any{}
 	if len(req.Tools) > 0 {
 		kiroTools := make([]any, 0, len(req.Tools))
+		var droppedCount, rewrittenCount int
 		for _, t := range req.Tools {
 			switch {
 			case isAnthropicServerSideWebSearch(t):
@@ -232,6 +234,7 @@ func BuildKiroPayload(req *AnthropicRequest, opts BuildOptions) (map[string]any,
 				// intercept the tool_use event and fulfil it via Kiro's
 				// /mcp endpoint.
 				t = rewriteToFunctionWebSearch(t)
+				rewrittenCount++
 			case t.Type != "" && t.Type != "function" && t.Type != "custom":
 				// Drop other Anthropic server-side tools (computer_*,
 				// text_editor_*, bash_*, ...). Kiro CodeWhisperer only
@@ -239,6 +242,7 @@ func BuildKiroPayload(req *AnthropicRequest, opts BuildOptions) (map[string]any,
 				// concrete inputSchema; forwarding server-side tools
 				// verbatim causes the upstream to respond with "Invalid
 				// tool parameters".
+				droppedCount++
 				continue
 			}
 			var schema any
@@ -256,6 +260,15 @@ func BuildKiroPayload(req *AnthropicRequest, opts BuildOptions) (map[string]any,
 		}
 		if len(kiroTools) > 0 {
 			userInputContext["tools"] = kiroTools
+		}
+		// Log rewrite/drop counts at Debug so normal traffic stays quiet.
+		if rewrittenCount > 0 || droppedCount > 0 {
+			slog.Debug("kiro request: tool-spec rewrite summary",
+				"input_count", len(req.Tools),
+				"output_count", len(kiroTools),
+				"rewritten_web_search", rewrittenCount,
+				"dropped_server_side", droppedCount,
+			)
 		}
 	}
 

@@ -24,9 +24,9 @@ func (f *fakeInterceptor) OnToolStart(_ context.Context, ev *StreamEvent) bool {
 	return ev != nil && ev.ToolName == f.matchName
 }
 
-func (f *fakeInterceptor) OnToolStop(_ context.Context, _, _ string, input string) ([]*StreamEvent, error) {
+func (f *fakeInterceptor) OnToolStop(_ context.Context, _, _ string, input string, emit func(*StreamEvent) error) error {
 	f.seenInput = input
-	return []*StreamEvent{{Kind: "content", Text: f.replaceTxt}}, nil
+	return emit(&StreamEvent{Kind: "content", Text: f.replaceTxt})
 }
 
 // TestDriveEventStream_InterceptorSwallowsToolUseAndSubstitutesText verifies
@@ -71,6 +71,63 @@ func TestDriveEventStream_InterceptorSwallowsToolUseAndSubstitutesText(t *testin
 	require.NotContains(t, sse, "input_json_delta",
 		"partial_json leaked to client SSE")
 	require.Contains(t, sse, "[search results]")
+}
+
+// TestDriveEventStream_MultipleStartFramesAccumulateInput verifies the
+// real Kiro wire format: every toolUseEvent frame carries the `name`
+// field, even the "delta" frames. The driver treats the first frame as
+// a start and subsequent same-id frames as tool_use_delta, so the input
+// gets reassembled correctly.
+func TestDriveEventStream_MultipleStartFramesAccumulateInput(t *testing.T) {
+	stream := concat(
+		testFrameJSON("toolUseEvent", map[string]any{
+			"toolUseId": "tX", "name": "web_search", "input": `{"query":"today`,
+		}),
+		testFrameJSON("toolUseEvent", map[string]any{
+			"toolUseId": "tX", "name": "web_search", "input": ` news`,
+		}),
+		testFrameJSON("toolUseEvent", map[string]any{
+			"toolUseId": "tX", "name": "web_search", "input": ` 2026"}`,
+		}),
+		testFrameJSON("toolUseEvent", map[string]any{
+			"toolUseId": "tX", "stop": true,
+		}),
+	)
+
+	var out bytes.Buffer
+	enc := NewAnthropicSSEEncoder(&out, nil, "claude-sonnet-4.5")
+
+	interceptor := &fakeInterceptor{matchName: "web_search", replaceTxt: "OK"}
+	_, err := DriveEventStreamToAnthropicWithInterceptor(
+		context.Background(), bytes.NewReader(stream), enc, interceptor,
+	)
+	require.NoError(t, err)
+	require.Equal(t, `{"query":"today news 2026"}`, interceptor.seenInput)
+}
+
+// TestDriveEventStream_EOFFlushFinalisesPendingInterceptedTool verifies
+// that if Kiro ends the stream without an explicit tool_use_stop frame,
+// the driver still flushes the interceptor so the client sees a response.
+func TestDriveEventStream_EOFFlushFinalisesPendingInterceptedTool(t *testing.T) {
+	stream := concat(
+		testFrameJSON("toolUseEvent", map[string]any{
+			"toolUseId": "tE", "name": "web_search", "input": `{"query":"x"}`,
+		}),
+		// No explicit stop frame; EOF follows immediately.
+	)
+
+	var out bytes.Buffer
+	enc := NewAnthropicSSEEncoder(&out, nil, "claude-sonnet-4.5")
+
+	interceptor := &fakeInterceptor{matchName: "web_search", replaceTxt: "[flushed]"}
+	_, err := DriveEventStreamToAnthropicWithInterceptor(
+		context.Background(), bytes.NewReader(stream), enc, interceptor,
+	)
+	require.NoError(t, err)
+	require.NoError(t, enc.Finish("end_turn"))
+
+	require.Equal(t, `{"query":"x"}`, interceptor.seenInput)
+	require.Contains(t, out.String(), "[flushed]")
 }
 
 // TestDriveEventStream_NonMatchingInterceptorPassesThrough verifies that
