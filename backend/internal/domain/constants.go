@@ -22,6 +22,7 @@ const (
 	PlatformOpenAI      = "openai"
 	PlatformGemini      = "gemini"
 	PlatformAntigravity = "antigravity"
+	PlatformKiro        = "kiro"
 )
 
 // Account type constants
@@ -33,6 +34,27 @@ const (
 	AccountTypeBedrock        = "bedrock"         // AWS Bedrock 类型账号（通过 SigV4 签名或 API Key 连接 Bedrock，由 credentials.auth_mode 区分）
 	AccountTypeServiceAccount = "service_account" // Google Service Account 类型账号（用于 Vertex AI）
 )
+
+// DefaultKiroModelMapping maps Anthropic model aliases to Kiro internal model ids.
+// Mirrors kiro.DefaultModelMapping (internal/pkg/kiro/request_transformer.go) and
+// is duplicated here so that front-end forms can surface defaults without
+// depending on the kiro package.
+var DefaultKiroModelMapping = map[string]string{
+	"claude-sonnet-4-5":          "claude-sonnet-4.5",
+	"claude-sonnet-4-5-20250929": "claude-sonnet-4.5",
+	"claude-haiku-4-5":           "claude-haiku-4.5",
+	"claude-haiku-4-5-20251001":  "claude-haiku-4.5",
+	"claude-opus-4-5":            "claude-opus-4.5",
+	"claude-opus-4-5-20251101":   "claude-opus-4.5",
+	"claude-sonnet-4":            "claude-sonnet-4",
+	"claude-sonnet-4-20250514":   "claude-sonnet-4",
+	"claude-3-7-sonnet-20250219": "claude-3.7-sonnet",
+	"claude-3-7-sonnet":          "claude-3.7-sonnet",
+	"claude-3.7-sonnet":          "claude-3.7-sonnet",
+	"claude-sonnet-4.5":          "claude-sonnet-4.5",
+	"claude-haiku-4.5":           "claude-haiku-4.5",
+	"claude-opus-4.5":            "claude-opus-4.5",
+}
 
 // Redeem type constants
 const (

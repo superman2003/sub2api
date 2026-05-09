@@ -503,6 +503,14 @@ type ForwardResult struct {
 	// 图片生成计费字段（图片生成模型使用）
 	ImageCount int    // 生成的图片数量
 	ImageSize  string // 图片尺寸 "1K", "2K", "4K"
+
+	// KiroMeteringCredit is the credit usage reported by Kiro's meteringEvent
+	// frame. Only populated for platform=kiro requests and used downstream by
+	// the billing pipeline (Q1-A: credit-based billing with group multiplier).
+	KiroMeteringCredit float64
+	// KiroContextUsagePct mirrors contextUsageEvent.contextUsagePercentage for
+	// observability dashboards.
+	KiroContextUsagePct float64
 }
 
 // UpstreamFailoverError indicates an upstream error that should trigger account failover.
@@ -8460,6 +8468,22 @@ func (s *GatewayService) calculateRecordUsageCost(
 	imageMultiplier float64,
 	opts *recordUsageOpts,
 ) *CostBreakdown {
+	// Kiro credit-based 计费：上游 meteringEvent 以 credit 为单位（1 credit = $0.04，
+	// 即 25 credits = $1），这里换算成 USD 再乘以分组倍率写入账单。
+	if result.KiroMeteringCredit > 0 {
+		const kiroCreditUSD = 0.04 // 1 credit = $0.04
+		credit := result.KiroMeteringCredit
+		totalUSD := credit * kiroCreditUSD
+		actualUSD := totalUSD * multiplier
+		return &CostBreakdown{
+			InputCost:   0,
+			OutputCost:  totalUSD, // 记入 output 口径方便累计展示；原始 credit 不直接存
+			TotalCost:   totalUSD,
+			ActualCost:  actualUSD,
+			BillingMode: "kiro_credit",
+		}
+	}
+
 	// 图片生成计费
 	if result.ImageCount > 0 {
 		return s.calculateImageCost(ctx, result, apiKey, billingModel, imageMultiplier)

@@ -20,6 +20,7 @@ import (
 	"github.com/Wei-Shaw/sub2api/internal/config"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/claude"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/geminicli"
+	"github.com/Wei-Shaw/sub2api/internal/pkg/kiro"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/openai"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/openai_compat"
 	"github.com/Wei-Shaw/sub2api/internal/util/urlvalidator"
@@ -67,6 +68,7 @@ type AccountTestService struct {
 	geminiTokenProvider       *GeminiTokenProvider
 	claudeTokenProvider       *ClaudeTokenProvider
 	antigravityGatewayService *AntigravityGatewayService
+	kiroGatewayService        *KiroGatewayService
 	httpUpstream              HTTPUpstream
 	cfg                       *config.Config
 	tlsFPProfileService       *TLSFingerprintProfileService
@@ -78,6 +80,7 @@ func NewAccountTestService(
 	geminiTokenProvider *GeminiTokenProvider,
 	claudeTokenProvider *ClaudeTokenProvider,
 	antigravityGatewayService *AntigravityGatewayService,
+	kiroGatewayService *KiroGatewayService,
 	httpUpstream HTTPUpstream,
 	cfg *config.Config,
 	tlsFPProfileService *TLSFingerprintProfileService,
@@ -87,6 +90,7 @@ func NewAccountTestService(
 		geminiTokenProvider:       geminiTokenProvider,
 		claudeTokenProvider:       claudeTokenProvider,
 		antigravityGatewayService: antigravityGatewayService,
+		kiroGatewayService:        kiroGatewayService,
 		httpUpstream:              httpUpstream,
 		cfg:                       cfg,
 		tlsFPProfileService:       tlsFPProfileService,
@@ -190,6 +194,10 @@ func (s *AccountTestService) TestAccountConnection(c *gin.Context, accountID int
 
 	if account.Platform == PlatformAntigravity {
 		return s.routeAntigravityTest(c, account, modelID, prompt)
+	}
+
+	if account.Platform == PlatformKiro {
+		return s.testKiroAccountConnection(c, account, modelID, prompt)
 	}
 
 	return s.testClaudeAccountConnection(c, account, modelID)
@@ -1507,6 +1515,132 @@ func (s *AccountTestService) testOpenAIImageOAuth(c *gin.Context, ctx context.Co
 		})
 	}
 
+	s.sendEvent(c, TestEvent{Type: "test_complete", Success: true})
+	return nil
+}
+
+// testKiroAccountConnection tests a Kiro account by sending a minimal Anthropic
+// request through the Kiro CodeWhisperer upstream. Unlike testClaudeAccountConnection,
+// auth goes through the Kiro token provider and the endpoint is CodeWhisperer
+// (not api.anthropic.com). Response is an AWS EventStream we decode via the kiro package.
+func (s *AccountTestService) testKiroAccountConnection(c *gin.Context, account *Account, modelID string, prompt string) error {
+	ctx := c.Request.Context()
+
+	if s.kiroGatewayService == nil {
+		return s.sendErrorAndEnd(c, "Kiro gateway service not configured")
+	}
+
+	testModelID := modelID
+	if testModelID == "" {
+		testModelID = "claude-sonnet-4.5"
+	}
+
+	testPrompt := strings.TrimSpace(prompt)
+	if testPrompt == "" {
+		testPrompt = "hi"
+	}
+
+	// Resolve access token (refresh as needed).
+	token, err := s.kiroGatewayService.tokenProvider.GetAccessToken(ctx, account)
+	if err != nil {
+		return s.sendErrorAndEnd(c, fmt.Sprintf("Failed to get Kiro access token: %s", err.Error()))
+	}
+	profileArn := s.kiroGatewayService.tokenProvider.ProfileArn(account)
+	if profileArn == "" {
+		return s.sendErrorAndEnd(c, "Kiro account missing profile_arn")
+	}
+
+	// Build a minimal Anthropic request and transform it into Kiro payload.
+	userContent, _ := json.Marshal([]map[string]any{
+		{"type": "text", "text": testPrompt},
+	})
+	anthropicReq := &kiro.AnthropicRequest{
+		Model:     testModelID,
+		MaxTokens: 64,
+		Stream:    true,
+		Messages: []kiro.AnthropicMessage{
+			{Role: "user", Content: userContent},
+		},
+	}
+	mapping := kiroModelMappingForAccount(account)
+	payload, err := kiro.BuildKiroPayload(anthropicReq, kiro.BuildOptions{
+		ProfileArn:   profileArn,
+		ModelMapping: mapping,
+	})
+	if err != nil {
+		return s.sendErrorAndEnd(c, fmt.Sprintf("Failed to build Kiro payload: %s", err.Error()))
+	}
+
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return s.sendErrorAndEnd(c, fmt.Sprintf("Failed to marshal Kiro payload: %s", err.Error()))
+	}
+
+	forwardCtx, cancel := context.WithTimeout(ctx, kiroForwardTimeout)
+	defer cancel()
+
+	// Set SSE headers for the response we stream back to the admin UI.
+	c.Writer.Header().Set("Content-Type", "text/event-stream")
+	c.Writer.Header().Set("Cache-Control", "no-cache")
+	c.Writer.Header().Set("Connection", "keep-alive")
+	c.Writer.Header().Set("X-Accel-Buffering", "no")
+	c.Writer.Flush()
+
+	s.sendEvent(c, TestEvent{Type: "test_start", Model: testModelID})
+	s.sendEvent(c, TestEvent{Type: "connected"})
+
+	req, err := http.NewRequestWithContext(forwardCtx, http.MethodPost, kiroUpstreamEndpoint, bytes.NewReader(body))
+	if err != nil {
+		return s.sendErrorAndEnd(c, fmt.Sprintf("Failed to build Kiro request: %s", err.Error()))
+	}
+	req.Header = kiroUpstreamHeaders(token)
+
+	client := s.kiroGatewayService.clientForAccount(account)
+	resp, err := client.Do(req)
+	if err != nil {
+		return s.sendErrorAndEnd(c, fmt.Sprintf("Kiro request failed: %s", err.Error()))
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 16*1024))
+		return s.sendErrorAndEnd(c, fmt.Sprintf("Kiro returned %d: %s", resp.StatusCode, string(raw)))
+	}
+
+	// Decode the AWS EventStream and accumulate the assistant text for display.
+	s.sendEvent(c, TestEvent{Type: "model_info", Model: testModelID})
+
+	reader := kiro.NewEventStreamReader(resp.Body)
+	var textBuf bytes.Buffer
+	for {
+		msg, err := reader.Next()
+		if err != nil {
+			if errors.Is(err, io.EOF) {
+				break
+			}
+			return s.sendErrorAndEnd(c, fmt.Sprintf("Kiro stream read error: %s", err.Error()))
+		}
+		evt, perr := kiro.ParseEventStreamFrame(msg)
+		if perr != nil {
+			continue
+		}
+		if evt == nil {
+			continue
+		}
+		switch evt.Kind {
+		case "content":
+			if evt.Text != "" {
+				textBuf.WriteString(evt.Text)
+				s.sendEvent(c, TestEvent{Type: "content", Text: evt.Text})
+			}
+		case "error":
+			return s.sendErrorAndEnd(c, fmt.Sprintf("Kiro upstream error: %s", evt.ErrorMessage))
+		}
+	}
+
+	if textBuf.Len() == 0 {
+		s.sendEvent(c, TestEvent{Type: "content", Text: "(no content)"})
+	}
 	s.sendEvent(c, TestEvent{Type: "test_complete", Success: true})
 	return nil
 }

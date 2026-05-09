@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"strconv"
+	"time"
 
 	"github.com/Wei-Shaw/sub2api/internal/service"
 	"github.com/redis/go-redis/v9"
@@ -48,10 +49,7 @@ var (
 		local maxConcurrency = tonumber(ARGV[1])
 		local ttl = tonumber(ARGV[2])
 		local requestID = ARGV[3]
-
-		-- 使用 Redis 服务器时间，确保多实例时钟一致
-		local timeResult = redis.call('TIME')
-		local now = tonumber(timeResult[1])
+		local now = tonumber(ARGV[4])
 		local expireBefore = now - ttl
 
 		-- 清理过期槽位
@@ -83,10 +81,7 @@ var (
 	getCountScript = redis.NewScript(`
 		local key = KEYS[1]
 		local ttl = tonumber(ARGV[1])
-
-		-- 使用 Redis 服务器时间
-		local timeResult = redis.call('TIME')
-		local now = tonumber(timeResult[1])
+		local now = tonumber(ARGV[2])
 		local expireBefore = now - ttl
 
 		redis.call('ZREMRANGEBYSCORE', key, '-inf', expireBefore)
@@ -153,8 +148,7 @@ var (
 	cleanupExpiredSlotsScript = redis.NewScript(`
 		local key = KEYS[1]
 		local ttl = tonumber(ARGV[1])
-		local timeResult = redis.call('TIME')
-		local now = tonumber(timeResult[1])
+		local now = tonumber(ARGV[2])
 		local expireBefore = now - ttl
 		redis.call('ZREMRANGEBYSCORE', key, '-inf', expireBefore)
 		if redis.call('ZCARD', key) == 0 then
@@ -234,8 +228,8 @@ func accountWaitKey(accountID int64) string {
 
 func (c *concurrencyCache) AcquireAccountSlot(ctx context.Context, accountID int64, maxConcurrency int, requestID string) (bool, error) {
 	key := accountSlotKey(accountID)
-	// 时间戳在 Lua 脚本内使用 Redis TIME 命令获取，确保多实例时钟一致
-	result, err := acquireScript.Run(ctx, c.rdb, []string{key}, maxConcurrency, c.slotTTLSeconds, requestID).Int()
+	now := time.Now().Unix()
+	result, err := acquireScript.Run(ctx, c.rdb, []string{key}, maxConcurrency, c.slotTTLSeconds, requestID, now).Int()
 	if err != nil {
 		return false, err
 	}
@@ -249,8 +243,8 @@ func (c *concurrencyCache) ReleaseAccountSlot(ctx context.Context, accountID int
 
 func (c *concurrencyCache) GetAccountConcurrency(ctx context.Context, accountID int64) (int, error) {
 	key := accountSlotKey(accountID)
-	// 时间戳在 Lua 脚本内使用 Redis TIME 命令获取
-	result, err := getCountScript.Run(ctx, c.rdb, []string{key}, c.slotTTLSeconds).Int()
+	now := time.Now().Unix()
+	result, err := getCountScript.Run(ctx, c.rdb, []string{key}, c.slotTTLSeconds, now).Int()
 	if err != nil {
 		return 0, err
 	}
@@ -298,8 +292,8 @@ func (c *concurrencyCache) GetAccountConcurrencyBatch(ctx context.Context, accou
 
 func (c *concurrencyCache) AcquireUserSlot(ctx context.Context, userID int64, maxConcurrency int, requestID string) (bool, error) {
 	key := userSlotKey(userID)
-	// 时间戳在 Lua 脚本内使用 Redis TIME 命令获取，确保多实例时钟一致
-	result, err := acquireScript.Run(ctx, c.rdb, []string{key}, maxConcurrency, c.slotTTLSeconds, requestID).Int()
+	now := time.Now().Unix()
+	result, err := acquireScript.Run(ctx, c.rdb, []string{key}, maxConcurrency, c.slotTTLSeconds, requestID, now).Int()
 	if err != nil {
 		return false, err
 	}
@@ -313,8 +307,8 @@ func (c *concurrencyCache) ReleaseUserSlot(ctx context.Context, userID int64, re
 
 func (c *concurrencyCache) GetUserConcurrency(ctx context.Context, userID int64) (int, error) {
 	key := userSlotKey(userID)
-	// 时间戳在 Lua 脚本内使用 Redis TIME 命令获取
-	result, err := getCountScript.Run(ctx, c.rdb, []string{key}, c.slotTTLSeconds).Int()
+	now := time.Now().Unix()
+	result, err := getCountScript.Run(ctx, c.rdb, []string{key}, c.slotTTLSeconds, now).Int()
 	if err != nil {
 		return 0, err
 	}
@@ -490,7 +484,8 @@ func (c *concurrencyCache) GetUsersLoadBatch(ctx context.Context, users []servic
 
 func (c *concurrencyCache) CleanupExpiredAccountSlots(ctx context.Context, accountID int64) error {
 	key := accountSlotKey(accountID)
-	_, err := cleanupExpiredSlotsScript.Run(ctx, c.rdb, []string{key}, c.slotTTLSeconds).Result()
+	now := time.Now().Unix()
+	_, err := cleanupExpiredSlotsScript.Run(ctx, c.rdb, []string{key}, c.slotTTLSeconds, now).Result()
 	return err
 }
 

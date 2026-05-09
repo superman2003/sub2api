@@ -41,6 +41,9 @@ func RegisterAdminRoutes(
 		// Antigravity OAuth
 		registerAntigravityOAuthRoutes(admin, h)
 
+		// Kiro OAuth
+		registerKiroOAuthRoutes(admin, h)
+
 		// 代理管理
 		registerProxyRoutes(admin, h)
 
@@ -363,6 +366,29 @@ func registerAntigravityOAuthRoutes(admin *gin.RouterGroup, h *handler.Handlers)
 		antigravity.POST("/oauth/auth-url", h.Admin.AntigravityOAuth.GenerateAuthURL)
 		antigravity.POST("/oauth/exchange-code", h.Admin.AntigravityOAuth.ExchangeCode)
 		antigravity.POST("/oauth/refresh-token", h.Admin.AntigravityOAuth.RefreshToken)
+	}
+}
+
+// registerKiroOAuthRoutes wires the Kiro (Cognito + Google IdP) OAuth flow.
+// The front-end posts:
+//   - POST /admin/kiro/oauth/auth-url       -> returns Cognito authorize URL + session_id
+//   - POST /admin/kiro/oauth/exchange-code  -> redeems the callback (URL or code) for tokens
+//   - POST /admin/kiro/oauth/refresh-token  -> validates an existing refresh token
+//   - POST /admin/kiro/create-from-oauth    -> exchanges code + persists a new account (Q3-A flow)
+//   - POST /admin/kiro/create-from-tokens   -> persists an account from pasted tokens (Q3-B flow)
+func registerKiroOAuthRoutes(admin *gin.RouterGroup, h *handler.Handlers) {
+	kiro := admin.Group("/kiro")
+	{
+		kiro.POST("/oauth/auth-url", h.Admin.KiroOAuth.GenerateAuthURL)
+		kiro.POST("/oauth/exchange-code", h.Admin.KiroOAuth.ExchangeCode)
+		kiro.POST("/oauth/refresh-token", h.Admin.KiroOAuth.RefreshToken)
+		kiro.POST("/create-from-oauth", h.Admin.KiroOAuth.CreateAccountFromOAuth)
+		kiro.POST("/create-from-tokens", h.Admin.KiroOAuth.CreateAccountFromTokens)
+		kiro.POST("/accounts/:id/quota", h.Admin.KiroOAuth.FetchAccountQuota)
+		// AWS Builder ID — OIDC Device Authorization Grant
+		kiro.POST("/builderid/start", h.Admin.KiroOAuth.StartBuilderIDLogin)
+		kiro.POST("/builderid/poll", h.Admin.KiroOAuth.PollBuilderIDLogin)
+		kiro.POST("/builderid/create-account", h.Admin.KiroOAuth.CreateAccountFromBuilderID)
 	}
 }
 

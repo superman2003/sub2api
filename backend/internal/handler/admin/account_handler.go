@@ -50,6 +50,7 @@ type AccountHandler struct {
 	openaiOAuthService      *service.OpenAIOAuthService
 	geminiOAuthService      *service.GeminiOAuthService
 	antigravityOAuthService *service.AntigravityOAuthService
+	kiroOAuthService        *service.KiroOAuthService
 	rateLimitService        *service.RateLimitService
 	accountUsageService     *service.AccountUsageService
 	accountTestService      *service.AccountTestService
@@ -67,6 +68,7 @@ func NewAccountHandler(
 	openaiOAuthService *service.OpenAIOAuthService,
 	geminiOAuthService *service.GeminiOAuthService,
 	antigravityOAuthService *service.AntigravityOAuthService,
+	kiroOAuthService *service.KiroOAuthService,
 	rateLimitService *service.RateLimitService,
 	accountUsageService *service.AccountUsageService,
 	accountTestService *service.AccountTestService,
@@ -82,6 +84,7 @@ func NewAccountHandler(
 		openaiOAuthService:      openaiOAuthService,
 		geminiOAuthService:      geminiOAuthService,
 		antigravityOAuthService: antigravityOAuthService,
+		kiroOAuthService:        kiroOAuthService,
 		rateLimitService:        rateLimitService,
 		accountUsageService:     accountUsageService,
 		accountTestService:      accountTestService,
@@ -898,6 +901,48 @@ func (h *AccountHandler) refreshSingleAccount(ctx context.Context, account *serv
 		if account.Status == service.StatusError && strings.Contains(account.ErrorMessage, "missing_project_id:") {
 			if _, clearErr := h.adminService.ClearAccountError(ctx, account.ID); clearErr != nil {
 				return nil, "", fmt.Errorf("failed to clear account error: %w", clearErr)
+			}
+		}
+	} else if account.Platform == service.PlatformKiro {
+		// Kiro OAuth refresh requires the existing access_token (to fetch CSRF
+		// from app.kiro.dev HTML) and the refresh_token (the RefreshToken RPC
+		// credential). The rotated csrf_token is persisted alongside other
+		// credentials so subsequent refreshes can skip the HTML scrape step.
+		prevAccess := account.GetCredential("access_token")
+		prevRefresh := account.GetCredential("refresh_token")
+		prevCSRF := account.GetCredential("csrf_token")
+
+		var proxyURL string
+		if account.Proxy != nil {
+			proxyURL = account.Proxy.URL()
+		}
+
+		tokenInfo, err := h.kiroOAuthService.RefreshAccountToken(ctx, prevAccess, prevRefresh, prevCSRF, proxyURL)
+		if err != nil {
+			return nil, "", err
+		}
+
+		newCredentials = h.kiroOAuthService.BuildAccountCredentials(tokenInfo)
+		for k, v := range account.Credentials {
+			if _, exists := newCredentials[k]; !exists {
+				newCredentials[k] = v
+			}
+		}
+		// Preserve profile_arn / email / user_id if the refresh response omits
+		// them (Kiro's RefreshToken RPC only returns the accessToken and csrf).
+		if arn, _ := newCredentials["profile_arn"].(string); arn == "" {
+			if prev := strings.TrimSpace(account.GetCredential("profile_arn")); prev != "" {
+				newCredentials["profile_arn"] = prev
+			}
+		}
+		if email, _ := newCredentials["email"].(string); email == "" {
+			if prev := strings.TrimSpace(account.GetCredential("email")); prev != "" {
+				newCredentials["email"] = prev
+			}
+		}
+		if uid, _ := newCredentials["user_id"].(string); uid == "" {
+			if prev := strings.TrimSpace(account.GetCredential("user_id")); prev != "" {
+				newCredentials["user_id"] = prev
 			}
 		}
 	} else {

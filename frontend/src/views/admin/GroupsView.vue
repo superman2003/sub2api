@@ -106,7 +106,9 @@
                     ? 'bg-emerald-100 text-emerald-700 dark:bg-emerald-900/30 dark:text-emerald-400'
                     : value === 'antigravity'
                       ? 'bg-purple-100 text-purple-700 dark:bg-purple-900/30 dark:text-purple-400'
-                      : 'bg-blue-100 text-blue-700 dark:bg-blue-900/30 dark:text-blue-400',
+                      : value === 'kiro'
+                        ? 'bg-indigo-100 text-indigo-700 dark:bg-indigo-900/30 dark:text-indigo-400'
+                        : 'bg-blue-100 text-blue-700 dark:bg-blue-900/30 dark:text-blue-400',
               ]"
             >
               <PlatformIcon :platform="value" size="xs" />
@@ -2925,6 +2927,7 @@ const platformOptions = computed(() => [
   { value: "openai", label: "OpenAI" },
   { value: "gemini", label: "Gemini" },
   { value: "antigravity", label: "Antigravity" },
+  { value: "kiro", label: "Kiro" },
 ]);
 
 const platformFilterOptions = computed(() => [
@@ -2933,6 +2936,7 @@ const platformFilterOptions = computed(() => [
   { value: "openai", label: "OpenAI" },
   { value: "gemini", label: "Gemini" },
   { value: "antigravity", label: "Antigravity" },
+  { value: "kiro", label: "Kiro" },
 ]);
 
 const editStatusOptions = computed(() => [
@@ -3722,10 +3726,23 @@ const handleCreateGroup = async () => {
           : undefined,
     };
     // v-model.number 清空输入框时产生 ""，转为 null 让后端设为无限制
-    const emptyToNull = (v: any) => (v === "" ? null : v);
+    const emptyToNull = (v: any) => (v === "" || (typeof v === "number" && isNaN(v)) ? null : v);
     requestData.daily_limit_usd = emptyToNull(requestData.daily_limit_usd);
     requestData.weekly_limit_usd = emptyToNull(requestData.weekly_limit_usd);
     requestData.monthly_limit_usd = emptyToNull(requestData.monthly_limit_usd);
+    requestData.image_price_1k = emptyToNull(requestData.image_price_1k);
+    requestData.image_price_2k = emptyToNull(requestData.image_price_2k);
+    requestData.image_price_4k = emptyToNull(requestData.image_price_4k);
+    requestData.fallback_group_id = emptyToNull(requestData.fallback_group_id);
+    requestData.fallback_group_id_on_invalid_request = emptyToNull(requestData.fallback_group_id_on_invalid_request);
+    // rate_multiplier 不能为空，默认为 1
+    if ((requestData.rate_multiplier as unknown) === "" || (typeof requestData.rate_multiplier === "number" && isNaN(requestData.rate_multiplier))) {
+      requestData.rate_multiplier = 1.0;
+    }
+    // rpm_limit 不能为空，默认为 0
+    if ((requestData.rpm_limit as unknown) === "" || (typeof requestData.rpm_limit === "number" && isNaN(requestData.rpm_limit))) {
+      requestData.rpm_limit = 0;
+    }
     requestData.image_rate_multiplier = normalizeImageRateMultiplier(
       requestData.image_rate_multiplier,
     );
@@ -3739,7 +3756,7 @@ const handleCreateGroup = async () => {
     }
   } catch (error: any) {
     appStore.showError(
-      error.response?.data?.detail || t("admin.groups.failedToCreate"),
+      error.message || t("admin.groups.failedToCreate"),
     );
     console.error("Error creating group:", error);
     // Don't advance tour on error
@@ -3853,10 +3870,21 @@ const handleUpdateGroup = async () => {
           : undefined,
     };
     // v-model.number 清空输入框时产生 ""，转为 null 让后端设为无限制
-    const emptyToNull = (v: any) => (v === "" ? null : v);
+    const emptyToNull = (v: any) => (v === "" || (typeof v === "number" && isNaN(v)) ? null : v);
     payload.daily_limit_usd = emptyToNull(payload.daily_limit_usd);
     payload.weekly_limit_usd = emptyToNull(payload.weekly_limit_usd);
     payload.monthly_limit_usd = emptyToNull(payload.monthly_limit_usd);
+    payload.image_price_1k = emptyToNull(payload.image_price_1k);
+    payload.image_price_2k = emptyToNull(payload.image_price_2k);
+    payload.image_price_4k = emptyToNull(payload.image_price_4k);
+    // rate_multiplier 不能为空，默认为 1
+    if ((payload.rate_multiplier as unknown) === "" || (typeof payload.rate_multiplier === "number" && isNaN(payload.rate_multiplier))) {
+      payload.rate_multiplier = 1.0;
+    }
+    // rpm_limit 不能为空，默认为 0
+    if ((payload.rpm_limit as unknown) === "" || (typeof payload.rpm_limit === "number" && isNaN(payload.rpm_limit))) {
+      payload.rpm_limit = 0;
+    }
     payload.image_rate_multiplier = normalizeImageRateMultiplier(
       payload.image_rate_multiplier,
     );
@@ -3866,7 +3894,7 @@ const handleUpdateGroup = async () => {
     loadGroups();
   } catch (error: any) {
     appStore.showError(
-      error.response?.data?.detail || t("admin.groups.failedToUpdate"),
+      error.message || t("admin.groups.failedToUpdate"),
     );
     console.error("Error updating group:", error);
   } finally {

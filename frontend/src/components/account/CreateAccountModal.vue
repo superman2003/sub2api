@@ -136,6 +136,19 @@
           </button>
           <button
             type="button"
+            @click="form.platform = 'kiro'"
+            :class="[
+              'flex flex-1 items-center justify-center gap-2 rounded-md px-4 py-2.5 text-sm font-medium transition-all',
+              form.platform === 'kiro'
+                ? 'bg-white text-indigo-600 shadow-sm dark:bg-dark-600 dark:text-indigo-400'
+                : 'text-gray-600 hover:text-gray-900 dark:text-gray-400 dark:hover:text-gray-200'
+            ]"
+          >
+            <Icon name="sparkles" size="sm" />
+            Kiro
+          </button>
+          <button
+            type="button"
             @click="form.platform = 'antigravity'"
             :class="[
               'flex flex-1 items-center justify-center gap-2 rounded-md px-4 py-2.5 text-sm font-medium transition-all',
@@ -149,6 +162,34 @@
           </button>
         </div>
       </div>
+
+      <!-- Kiro Platform: 内嵌专属向导（OAuth + 手动粘贴 Token），屏蔽下方所有通用表单 -->
+      <KiroAccountWizard
+        v-if="form.platform === 'kiro'"
+        embedded
+        :external-name="form.name"
+        :external-notes="form.notes || null"
+        :external-concurrency="form.concurrency"
+        :external-priority="form.priority"
+        :external-proxy-id="form.proxy_id"
+        :external-group-ids="form.group_ids"
+        @created="handleKiroCreated"
+        @close="handleClose"
+      />
+
+      <!-- Kiro 平台下仅保留"分组选择"，其余通用字段使用默认值 -->
+      <div v-if="form.platform === 'kiro' && !authStore.isSimpleMode">
+        <GroupSelector
+          v-model="form.group_ids"
+          :groups="groups"
+          :platform="form.platform"
+          :mixed-scheduling="mixedScheduling"
+          data-tour="account-form-groups"
+        />
+      </div>
+
+      <!-- 非 Kiro 平台的所有字段全部放在此 template 内，kiro 平台时整片不渲染 -->
+      <template v-if="form.platform !== 'kiro'">
 
       <!-- Account Type Selection (Anthropic) -->
       <div v-if="form.platform === 'anthropic'">
@@ -2745,6 +2786,7 @@
           data-tour="account-form-groups"
         />
       </div>
+      </template>
 
     </form>
 
@@ -2779,7 +2821,7 @@
     </div>
 
     <template #footer>
-      <div v-if="step === 1" class="flex justify-end gap-3">
+      <div v-if="step === 1 && form.platform !== 'kiro'" class="flex justify-end gap-3">
         <button @click="handleClose" type="button" class="btn btn-secondary">
           {{ t('common.cancel') }}
         </button>
@@ -2819,7 +2861,7 @@
           }}
         </button>
       </div>
-      <div v-else class="flex justify-between gap-3">
+      <div v-else-if="step !== 1 && form.platform !== 'kiro'" class="flex justify-between gap-3">
         <button type="button" class="btn btn-secondary" @click="goBackToBasicInfo">
           {{ t('common.back') }}
         </button>
@@ -3145,6 +3187,7 @@ import {
   type OpenAIWSMode
 } from '@/utils/openaiWsMode'
 import OAuthAuthorizationFlow from './OAuthAuthorizationFlow.vue'
+import KiroAccountWizard from './KiroAccountWizard.vue'
 
 // Type for exposed OAuthAuthorizationFlow component
 // Note: defineExpose automatically unwraps refs, so we use the unwrapped types
@@ -3502,6 +3545,10 @@ const form = reactive({
 
 // Helper to check if current type needs OAuth flow
 const isOAuthFlow = computed(() => {
+  // Kiro 平台使用内嵌 wizard，不走通用 OAuth 两步流程
+  if (form.platform === 'kiro') {
+    return false
+  }
   // Antigravity upstream 类型不需要 OAuth 流程
   if (form.platform === 'antigravity' && antigravityAccountType.value === 'upstream') {
     return false
@@ -4093,6 +4140,13 @@ const handleClose = () => {
   antigravityMixedChannelConfirmed.value = false
   clearMixedChannelDialog()
   emit('close')
+}
+
+// Kiro 平台创建成功回调（由嵌入的 KiroAccountWizard 触发）
+const handleKiroCreated = () => {
+  appStore.showSuccess(t('admin.accounts.accountCreated'))
+  emit('created')
+  handleClose()
 }
 
 const buildOpenAIExtra = (base?: Record<string, unknown>): Record<string, unknown> | undefined => {

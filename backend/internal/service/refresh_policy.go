@@ -61,6 +61,19 @@ func AntigravityProviderRefreshPolicy() ProviderRefreshPolicy {
 	}
 }
 
+// KiroProviderRefreshPolicy controls Kiro token refresh behaviour.
+// Kiro's CBOR RefreshToken RPC rotates both the accessToken and the CSRF
+// token, so a failed refresh is non-trivial to retry (we can lose the CSRF
+// rotation window). Surface errors immediately; the hot path will failover
+// and the background scheduler retries.
+func KiroProviderRefreshPolicy() ProviderRefreshPolicy {
+	return ProviderRefreshPolicy{
+		OnRefreshError: ProviderRefreshErrorReturn,
+		OnLockHeld:     ProviderLockHeldUseExistingToken,
+		FailureTTL:     0,
+	}
+}
+
 // BackgroundSkipAction 定义后台刷新服务在“未实际刷新”场景的计数方式。
 type BackgroundSkipAction int
 

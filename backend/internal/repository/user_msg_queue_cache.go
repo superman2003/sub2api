@@ -37,9 +37,7 @@ var releaseLockScript = redis.NewScript(`
 local cur = redis.call('GET', KEYS[1])
 if cur == ARGV[1] then
     redis.call('DEL', KEYS[1])
-    local t = redis.call('TIME')
-    local ms = tonumber(t[1])*1000 + math.floor(tonumber(t[2])/1000)
-    redis.call('SET', KEYS[2], ms, 'EX', 60)
+    redis.call('SET', KEYS[2], ARGV[2], 'EX', 60)
     return 1
 end
 return 0
@@ -93,7 +91,8 @@ func (c *userMsgQueueCache) AcquireLock(ctx context.Context, accountID int64, re
 func (c *userMsgQueueCache) ReleaseLock(ctx context.Context, accountID int64, requestID string) (bool, error) {
 	lockKey := umqLockKey(accountID)
 	lastKey := umqLastKey(accountID)
-	result, err := releaseLockScript.Run(ctx, c.rdb, []string{lockKey, lastKey}, requestID).Int()
+	nowMs := time.Now().UnixMilli()
+	result, err := releaseLockScript.Run(ctx, c.rdb, []string{lockKey, lastKey}, requestID, nowMs).Int()
 	if err != nil {
 		return false, fmt.Errorf("umq release lock: %w", err)
 	}
