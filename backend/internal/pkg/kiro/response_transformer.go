@@ -635,8 +635,10 @@ func DriveEventStreamToAnthropicWithInterceptor(
 	// <thinking>...</thinking> blocks when we injected the
 	// thinking_mode=enabled prompt — into a mix of content and thinking
 	// events. Stateful across chunks to handle tags split at arbitrary
-	// boundaries.
-	thinkSplitter := &ThinkingSplitter{}
+	// boundaries. The byte cap defensively protects against models that
+	// ignore the prompt-level budget and would otherwise eat the whole
+	// output token ceiling on reasoning alone.
+	thinkSplitter := &ThinkingSplitter{MaxThinkingBytes: defaultThinkingByteCap}
 
 	emit := func(ev *StreamEvent) error {
 		if ev.Kind == "content" {

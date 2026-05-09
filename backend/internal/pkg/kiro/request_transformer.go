@@ -221,14 +221,16 @@ func BuildKiroPayload(req *AnthropicRequest, opts BuildOptions) (map[string]any,
 		currentText = "Continue"
 	}
 
-	// Kiro has no native thinking/extended-reasoning API. When the client
-	// requests thinking we inject a prompt directive that makes the model
-	// wrap its reasoning in <thinking>...</thinking>; the response
-	// transformer (ThinkingSplitter) then peels those blocks out and
-	// emits them as proper Anthropic thinking_delta events.
-	if isThinkingRequested(req.Thinking) {
-		currentText = buildThinkingPreamble(req.Thinking, req.MaxTokens) + "\n\n" + currentText
-	}
+	// Kiro has no native thinking/extended-reasoning API. The "fake
+	// reasoning" approach (injecting <thinking_mode> tags) was found to
+	// cause severe output truncation because Kiro's upstream enforces a
+	// hard output-token ceiling that cannot be raised externally, and the
+	// model spends most of its budget on the thinking block. Disabled
+	// until Kiro adds native thinking support or raises its output cap.
+	//
+	// if isThinkingRequested(req.Thinking) {
+	//     currentText = buildThinkingPreamble(req.Thinking, req.MaxTokens) + "\n\n" + currentText
+	// }
 
 	// Build userInputMessageContext (tools + toolResults; images are inline).
 	userInputContext := map[string]any{}
@@ -487,8 +489,10 @@ func isThinkingRequested(th *AnthropicThinking) bool {
 // buildThinkingPreamble returns the instruction prepended to the current
 // user turn so the Kiro model emits its reasoning inside
 // <thinking>...</thinking> tags. The budget (max_thinking_length) is a
-// soft hint to the model; we cap it at roughly a third of the caller's
-// max_tokens so there's always room left over for the final answer.
+// soft hint to the model; we cap it aggressively because Kiro upstream
+// has a tier-based output-token ceiling that we cannot raise, so every
+// token spent in thinking is a token the model cannot use for the
+// answer itself.
 //
 // The preamble is deliberately written in a neutral, brief form so it
 // does not distract the model from the actual user request — earlier
@@ -496,23 +500,33 @@ func isThinkingRequested(th *AnthropicThinking) bool {
 // stop...") were observed to cause the model to truncate its final
 // answer after closing the thinking block.
 func buildThinkingPreamble(th *AnthropicThinking, maxTokens int) string {
-	budget := 4000
+	// Pick a conservative default. 1500 tokens is enough for useful
+	// planning on most requests and keeps plenty of room for the answer
+	// under Kiro's typical 8-16k ceiling.
+	budget := 1500
 	if th != nil && th.BudgetTokens > 0 {
 		budget = th.BudgetTokens
 	}
-	// Cap the advertised budget so the model keeps output headroom.
-	// Default behaviour for typical 32k max_tokens: budget stays <= 10k.
+	// Even if the caller asks for a big budget, keep thinking below a
+	// quarter of max_tokens so the model always has at least 75% left
+	// for the actual reply.
 	if maxTokens > 0 {
-		if cap := maxTokens / 3; cap > 0 && budget > cap {
+		if cap := maxTokens / 4; cap > 0 && budget > cap {
 			budget = cap
 		}
 	}
+	// Absolute hard cap regardless of max_tokens — thinking that exceeds
+	// 4000 tokens almost always wastes output budget on tangents.
+	if budget > 4000 {
+		budget = 4000
+	}
 	return fmt.Sprintf(
 		`[thinking_mode=enabled max_thinking_length=%d]`+"\n"+
-			`You may use <thinking>...</thinking> at the very start of your reply to reason privately about the request. `+
-			`Whatever is inside the tags is internal; the user sees only what comes after the closing </thinking> tag. `+
-			`The thinking block is optional — skip it for simple questions. `+
-			`After </thinking>, respond to the user's request in full as you normally would, with no length restriction.`,
-		budget,
+			`You may use a brief <thinking>...</thinking> block at the very start of your reply to plan. `+
+			`Contents of the thinking block are private — the user only sees what comes after </thinking>. `+
+			`IMPORTANT: The thinking block must stay under %d tokens. `+
+			`Skip the thinking block entirely for simple conversational questions. `+
+			`After </thinking>, answer the user in full as you normally would.`,
+		budget, budget,
 	)
 }

@@ -404,13 +404,11 @@ func parsedToKiroAnthropic(p *ParsedRequest) (*kiro.AnthropicRequest, error) {
 	if raw, ok := body["max_tokens"].(float64); ok {
 		req.MaxTokens = int(raw)
 	}
-	// Lift a too-small max_tokens floor. Some clients (Claude Code CLI in
-	// particular) hard-code max_tokens: 8000, which collapses into the
-	// thinking budget and leaves nothing for the actual answer. Local
-	// users going through their own Kiro account can afford a much
-	// bigger ceiling; raise the floor to 32 000 by default, overridable
-	// through SUB2API_KIRO_MAX_TOKENS_FLOOR (set to "0" to disable).
-	req.MaxTokens = maybeLiftMaxTokensFloor(req.MaxTokens)
+	// NOTE: Kiro CodeWhisperer does not honour an externally-supplied
+	// max_tokens field — its upstream enforces its own tier-based limit.
+	// We keep req.MaxTokens around only for downstream thinking-budget
+	// calculations (buildThinkingPreamble caps thinking at max_tokens/3
+	// so the model keeps headroom for the final answer).
 	if raw, ok := body["temperature"].(float64); ok {
 		v := raw
 		req.Temperature = &v
