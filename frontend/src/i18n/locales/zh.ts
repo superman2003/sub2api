@@ -2368,7 +2368,7 @@ export default {
         defaultImagePrice: '默认图片价格（未命中层级时使用）',
         platformConfig: '平台配置',
         webSearchEmulation: 'Web Search 模拟',
-        webSearchEmulationHint: '⚠️ 开启后该渠道下所有 Anthropic 分组的账号将自动拦截 web_search 请求，请谨慎操作',
+        webSearchEmulationHint: '⚠️ 开启后该渠道下所有 Anthropic 或 Kiro 分组的账号将自动拦截 web_search 请求并通过第三方搜索 Provider 返回结果，请谨慎操作',
         webSearchEmulationGlobalDisabled: '请先在系统设置 → 网关 → Web Search 模拟中启用全局开关',
         codexImageGenerationBridge: 'Codex 图片生成桥接',
         codexImageGenerationBridgeHint: '开启后，OpenAI 分组的 Codex /responses 文本请求可能会被自动注入 image_generation 工具。仅在路由账号支持图片生成时开启。',
@@ -5499,7 +5499,7 @@ export default {
       },
       webSearchEmulation: {
         title: 'Web Search 模拟',
-        description: '为不原生支持搜索的 Anthropic API Key 账号注入 web search 能力',
+        description: '为不原生支持搜索的 Anthropic API Key 与 Kiro 账号注入 web search 能力',
         enabled: '启用 Web Search 模拟',
         enabledHint: '全局开关。关闭后所有渠道和账号的 web search 模拟均不生效。',
         providers: '搜索服务商',

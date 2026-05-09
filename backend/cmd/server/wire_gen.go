@@ -187,6 +187,9 @@ func initializeApplication(buildInfo handler.BuildInfo) (*Application, error) {
 	digestSessionStore := service.NewDigestSessionStore()
 	channelRepository := repository.NewChannelRepository(db)
 	channelService := service.NewChannelService(channelRepository, groupRepository, apiKeyAuthCacheInvalidator, pricingService)
+	// Retrofit web-search emulation deps into KiroGatewayService; both services
+	// are now instantiated so it is safe to wire them together without cycles.
+	kiroGatewayService.SetWebSearchDeps(channelService)
 	modelPricingResolver := service.NewModelPricingResolver(channelService, billingService)
 	balanceNotifyService := service.ProvideBalanceNotifyService(emailService, settingRepository, accountRepository)
 	gatewayService := service.NewGatewayService(accountRepository, groupRepository, usageLogRepository, usageBillingRepository, userRepository, userSubscriptionRepository, userGroupRateRepository, gatewayCache, configConfig, schedulerSnapshotService, concurrencyService, billingService, rateLimitService, billingCacheService, identityService, httpUpstream, deferredService, claudeTokenProvider, sessionLimitCache, rpmCache, digestSessionStore, settingService, tlsFingerprintProfileService, channelService, modelPricingResolver, balanceNotifyService)

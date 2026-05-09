@@ -38,6 +38,10 @@ const kiroForwardTimeout = 3 * time.Minute
 type KiroGatewayService struct {
 	tokenProvider *KiroTokenProvider
 	settings      *SettingService
+	// channelService is optional and populated after construction via
+	// SetWebSearchDeps to avoid a wire cycle (ChannelService is constructed
+	// later in the wire graph than KiroGatewayService).
+	channelService *ChannelService
 	// httpClient is reused across requests; Kiro happily serves multiple
 	// sequential streaming calls over the same HTTP/2 connection so a single
 	// pool is fine.
@@ -68,6 +72,37 @@ func NewKiroGatewayService(tokenProvider *KiroTokenProvider, settings *SettingSe
 	}
 }
 
+// SetWebSearchDeps wires in the ChannelService used for channel-level
+// "default" emulation mode lookups. Called by wire_gen.go after both
+// services exist; safe to pass nil to keep the feature disabled.
+func (s *KiroGatewayService) SetWebSearchDeps(ch *ChannelService) {
+	if s == nil {
+		return
+	}
+	s.channelService = ch
+}
+
+// kiroWebSearchDeps adapts *KiroGatewayService's local state to the shared
+// webSearchEmulationDeps interface so the decision logic can be reused.
+type kiroWebSearchDeps struct {
+	settings *SettingService
+	channels *ChannelService
+}
+
+func (d kiroWebSearchDeps) IsWebSearchEmulationEnabledGlobally(ctx context.Context) bool {
+	if d.settings == nil {
+		return false
+	}
+	return d.settings.IsWebSearchEmulationEnabled(ctx)
+}
+
+func (d kiroWebSearchDeps) ChannelForGroup(ctx context.Context, groupID int64) (*Channel, error) {
+	if d.channels == nil {
+		return nil, fmt.Errorf("kiro websearch: channel service unavailable")
+	}
+	return d.channels.GetChannelForGroup(ctx, groupID)
+}
+
 // Forward is the entry point called from the gateway handler. It mirrors the
 // contract of AntigravityGatewayService.Forward: parse the request, select
 // payload fields, perform the streaming POST, and write an Anthropic-shaped
@@ -84,6 +119,16 @@ func (s *KiroGatewayService) Forward(
 	}
 	if parsed == nil {
 		return nil, errors.New("kiro forward: parsed request is nil")
+	}
+
+	// Web Search 模拟:Kiro CodeWhisperer 上游本身不支持 web_search 工具,
+	// 若请求里恰好只携带一个 web_search 工具且模拟条件成立,直接走第三方
+	// 搜索 Provider 构造 Anthropic 风格响应,跳过上游调用。
+	if evaluateWebSearchEmulation(ctx, kiroWebSearchDeps{
+		settings: s.settings,
+		channels: s.channelService,
+	}, account, parsed.GroupID, parsed.Body) {
+		return executeWebSearchEmulation(ctx, c, account, parsed)
 	}
 
 	// Resolve token (refresh as needed).

@@ -25,6 +25,38 @@ This fork adds **Kiro platform support** (Amazon Q Developer / CodeWhisperer) an
 
 ## Bug Fixes
 
+### Kiro WebSearch Unblocking (Claude Code → Kiro "Invalid tool parameters")
+- `AnthropicTool` now preserves the `type` field so server-side Anthropic tools
+  (`web_search_20250305`, `computer_20250124`, `text_editor_20250124`, ...)
+  can be detected and filtered before being forwarded to CodeWhisperer.
+  Previously the missing discriminator caused Kiro upstream to reject every
+  Claude Code session with "Invalid tool parameters" because the CLI ships
+  a `WebSearch` server-side tool by default.
+- `BuildKiroPayload` skips server-side tools when emitting
+  `toolSpecification` entries; if every tool is filtered, the whole
+  `tools` array is omitted instead of sent as `[]`.
+- Unit tests cover the user-defined vs server-side classification and the
+  no-op-on-all-filtered scenario.
+
+### Kiro WebSearch Emulation (third-party provider path)
+- `GetWebSearchEmulationMode` now allows **Kiro** accounts to participate in
+  the three-state feature flag (`enabled` / `disabled` / `default`), not only
+  Anthropic API Key accounts. `supportsWebSearchEmulation` remains a strict
+  allowlist so OpenAI / Gemini / Antigravity are unaffected.
+- `KiroGatewayService.Forward` intercepts web_search-only requests and routes
+  them through the existing `websearch.Manager` (Brave / Tavily providers),
+  replacing the upstream call with a locally-synthesised Anthropic SSE
+  response. Mirrors the long-standing behaviour of the Anthropic path.
+- The Anthropic and Kiro flows share a single decision function
+  (`evaluateWebSearchEmulation`) and a single response builder
+  (`executeWebSearchEmulation`) via a minimal dependency interface. This
+  avoids a wire cycle: `KiroGatewayService` gets its `ChannelService`
+  reference back-filled in `wire_gen.go` via a setter after both services
+  exist.
+- UI: Channel-edit page and account-edit modal now expose the web_search
+  emulation toggle for Kiro accounts in addition to Anthropic API Key ones.
+- Added `kiro_websearch_test.go` + updates to `request_transformer_test.go`.
+
 ### Group Creation (400 Bad Request)
 - Fixed `v-model.number` empty input producing `""` or `NaN` — now normalized to `null` or default values before sending to backend
 - Fixed `optionalLimitField.ToServiceInput()` treating `null` as "set to 0" instead of "unlimited"

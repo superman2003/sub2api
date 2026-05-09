@@ -2601,9 +2601,9 @@
         </div>
       </div>
 
-      <!-- Anthropic API Key: Web Search Emulation (hidden when global disabled) -->
+      <!-- Anthropic API Key / Kiro: Web Search Emulation (hidden when global disabled) -->
       <div
-        v-if="form.platform === 'anthropic' && accountCategory === 'apikey' && webSearchGlobalEnabled"
+        v-if="(((form.platform as string) === 'anthropic' && accountCategory === 'apikey') || (form.platform as string) === 'kiro') && webSearchGlobalEnabled"
         class="border-t border-gray-200 pt-4 dark:border-dark-600"
       >
         <div class="flex items-center justify-between">

@@ -324,8 +324,8 @@
               </div>
             </div>
 
-            <!-- Web Search Emulation (Anthropic only, hidden when global disabled) -->
-            <div v-if="section.platform === 'anthropic' && webSearchGlobalEnabled" class="border-t border-gray-200 pt-3 dark:border-dark-600">
+            <!-- Web Search Emulation (Anthropic + Kiro; hidden when global disabled) -->
+            <div v-if="(section.platform === 'anthropic' || section.platform === 'kiro') && webSearchGlobalEnabled" class="border-t border-gray-200 pt-3 dark:border-dark-600">
               <div class="flex items-center justify-between">
                 <div>
                   <label class="text-xs font-medium text-gray-700 dark:text-gray-300">
@@ -1048,13 +1048,14 @@ function formToAPI(): { group_ids: number[], model_pricing: ChannelModelPricing[
     }
   }
 
-  // Collect web_search_emulation (only anthropic platform supports it)
+  // Collect web_search_emulation (platforms whose native upstream lacks a
+  // working web_search tool: Anthropic API Key accounts and Kiro / CodeWhisperer).
   // Always write the key so that disabling in the UI correctly sets platform to false,
   // rather than leaving a stale true value from the cloned features_config.
   const wsEmulation: Record<string, boolean> = {}
   for (const section of form.platforms) {
     if (!section.enabled) continue
-    if (section.platform === 'anthropic') {
+    if (section.platform === 'anthropic' || section.platform === 'kiro') {
       wsEmulation[section.platform] = !!section.web_search_emulation
     }
   }

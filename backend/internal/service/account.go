@@ -1330,8 +1330,16 @@ const (
 // GetWebSearchEmulationMode 返回账号的 WebSearch 模拟模式。
 // 三态：default（跟随渠道）/ enabled（强制开启）/ disabled（强制关闭）。
 // 兼容旧 bool 值：true→enabled, false→default（并记录 debug 日志）。
+//
+// 适用平台：
+//   - Anthropic API Key：历史支持；跟随渠道配置。
+//   - Kiro：本仓补充支持；Kiro CodeWhisperer 上游不提供 web_search 能力，
+//     因此通过第三方搜索 Provider 模拟。Kiro 账号类型为 OAuth，故放行 Type 限制。
 func (a *Account) GetWebSearchEmulationMode() string {
-	if a == nil || a.Platform != PlatformAnthropic || a.Type != AccountTypeAPIKey || a.Extra == nil {
+	if a == nil || a.Extra == nil {
+		return WebSearchModeDefault
+	}
+	if !a.supportsWebSearchEmulation() {
 		return WebSearchModeDefault
 	}
 	raw := a.Extra[featureKeyWebSearchEmulation]
@@ -1352,6 +1360,29 @@ func (a *Account) GetWebSearchEmulationMode() string {
 		return mode
 	default:
 		return WebSearchModeDefault
+	}
+}
+
+// supportsWebSearchEmulation reports whether an account is eligible for the
+// third-party web search emulation path. Platforms whose native upstream
+// already ships a functional web_search tool (OpenAI, Gemini, Antigravity)
+// stay on the default (follow-channel) mode so the existing passthrough
+// is not accidentally hijacked.
+func (a *Account) supportsWebSearchEmulation() bool {
+	if a == nil {
+		return false
+	}
+	switch a.Platform {
+	case PlatformAnthropic:
+		// Historical behaviour: only Anthropic API Key accounts participate.
+		return a.Type == AccountTypeAPIKey
+	case PlatformKiro:
+		// Kiro upstream (CodeWhisperer) has no web_search tool of its own.
+		// Accept any account type (currently only OAuth is supported but
+		// future manual-token imports should also be eligible).
+		return true
+	default:
+		return false
 	}
 }
 

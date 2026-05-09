@@ -47,18 +47,62 @@ func getWebSearchManager() *websearch.Manager {
 	return webSearchManagerPtr.Load()
 }
 
+// webSearchEmulationDeps isolates the two dependencies the emulation pipeline
+// needs from the caller: the global enabled flag and the per-channel check.
+// Decoupling via an interface lets KiroGatewayService reuse the Anthropic
+// emulation logic without introducing a wire cycle.
+type webSearchEmulationDeps interface {
+	IsWebSearchEmulationEnabledGlobally(ctx context.Context) bool
+	ChannelForGroup(ctx context.Context, groupID int64) (*Channel, error)
+}
+
+// gatewayServiceWebSearchDeps adapts *GatewayService to webSearchEmulationDeps.
+type gatewayServiceWebSearchDeps struct {
+	settings *SettingService
+	channels *ChannelService
+}
+
+func (d gatewayServiceWebSearchDeps) IsWebSearchEmulationEnabledGlobally(ctx context.Context) bool {
+	if d.settings == nil {
+		return false
+	}
+	return d.settings.IsWebSearchEmulationEnabled(ctx)
+}
+
+func (d gatewayServiceWebSearchDeps) ChannelForGroup(ctx context.Context, groupID int64) (*Channel, error) {
+	if d.channels == nil {
+		return nil, fmt.Errorf("websearch: channel service unavailable")
+	}
+	return d.channels.GetChannelForGroup(ctx, groupID)
+}
+
 // shouldEmulateWebSearch checks whether a request should be intercepted.
 //
 // Judgment chain: manager exists → only web_search tool → global enabled → account/channel enabled.
 // Account-level mode: "enabled" (force on), "disabled" (force off), "default" (follow channel).
 func (s *GatewayService) shouldEmulateWebSearch(ctx context.Context, account *Account, groupID *int64, body []byte) bool {
+	return evaluateWebSearchEmulation(ctx, gatewayServiceWebSearchDeps{
+		settings: s.settingService,
+		channels: s.channelService,
+	}, account, groupID, body)
+}
+
+// evaluateWebSearchEmulation is the platform-agnostic core used by both
+// *GatewayService (Anthropic path) and *KiroGatewayService (Kiro path).
+func evaluateWebSearchEmulation(
+	ctx context.Context,
+	deps webSearchEmulationDeps,
+	account *Account,
+	groupID *int64,
+	body []byte,
+) bool {
 	if getWebSearchManager() == nil {
 		return false
 	}
 	if !isOnlyWebSearchToolInBody(body) {
 		return false
 	}
-	if !s.settingService.IsWebSearchEmulationEnabled(ctx) {
+	if deps == nil || !deps.IsWebSearchEmulationEnabledGlobally(ctx) {
 		return false
 	}
 
@@ -69,10 +113,10 @@ func (s *GatewayService) shouldEmulateWebSearch(ctx context.Context, account *Ac
 	case WebSearchModeDisabled:
 		return false
 	default: // "default" → follow channel config
-		if groupID == nil || s.channelService == nil {
+		if groupID == nil {
 			return false
 		}
-		ch, err := s.channelService.GetChannelForGroup(ctx, *groupID)
+		ch, err := deps.ChannelForGroup(ctx, *groupID)
 		if err != nil || ch == nil {
 			return false
 		}
@@ -143,6 +187,14 @@ func extractWebSearchTextFromContent(content gjson.Result) string {
 func (s *GatewayService) handleWebSearchEmulation(
 	ctx context.Context, c *gin.Context, account *Account, parsed *ParsedRequest,
 ) (*ForwardResult, error) {
+	return executeWebSearchEmulation(ctx, c, account, parsed)
+}
+
+// executeWebSearchEmulation performs the actual search + SSE/JSON build.
+// It is platform-agnostic and is shared between the Anthropic and Kiro paths.
+func executeWebSearchEmulation(
+	ctx context.Context, c *gin.Context, account *Account, parsed *ParsedRequest,
+) (*ForwardResult, error) {
 	startTime := time.Now()
 
 	// Release the serial queue lock immediately — we don't need upstream.
@@ -156,7 +208,8 @@ func (s *GatewayService) handleWebSearchEmulation(
 	}
 
 	slog.Info("web search emulation: executing search",
-		"account_id", account.ID, "account_name", account.Name, "query", query)
+		"account_id", account.ID, "account_name", account.Name,
+		"platform", account.Platform, "query", query)
 
 	resp, providerName, err := doWebSearch(ctx, account, query)
 	if err != nil {

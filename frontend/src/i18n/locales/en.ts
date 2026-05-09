@@ -2291,7 +2291,7 @@ export default {
         defaultImagePrice: 'Default image price (fallback when no tier matches)',
         platformConfig: 'Platform Configuration',
         webSearchEmulation: 'Web Search Emulation',
-        webSearchEmulationHint: '⚠️ When enabled, all accounts in this channel\'s Anthropic groups will intercept web_search requests. Use with caution.',
+        webSearchEmulationHint: '⚠️ When enabled, all accounts in this channel\'s Anthropic or Kiro groups will intercept web_search requests and route them through the configured third-party provider. Use with caution.',
         webSearchEmulationGlobalDisabled: 'Please enable the global switch first in Settings → Gateway → Web Search Emulation',
         codexImageGenerationBridge: 'Codex Image Generation Bridge',
         codexImageGenerationBridgeHint: 'When enabled, Codex /responses text requests in OpenAI groups may be automatically given the image_generation tool. Keep off unless the routed accounts support image generation.',
@@ -5340,7 +5340,7 @@ export default {
       },
       webSearchEmulation: {
         title: 'Web Search Emulation',
-        description: 'Inject web search capability for Anthropic API Key accounts that don\'t natively support it',
+        description: 'Inject web search capability for Anthropic API Key and Kiro accounts that don\'t natively support it',
         enabled: 'Enable Web Search Emulation',
         enabledHint: 'Global switch. When disabled, web search emulation is inactive for all channels and accounts.',
         providers: 'Search Providers',
