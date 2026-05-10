@@ -49,11 +49,11 @@ type kiroWebSearchInterceptor struct {
 
 // webSearchMaxRecursionDepth caps how many nested web_search calls the
 // Kiro model can trigger inside a single tool-use lifecycle. When the
-// cap is hit we still run the search but skip the follow-up turn that
-// would normally let the model continue — the raw results are streamed
-// as plain text so Claude Code (or whoever is driving) can finish the
-// conversation without hanging on a missing tool_result.
-const webSearchMaxRecursionDepth = 3
+// cap is hit the next follow-up turn is issued with `web_search` stripped
+// out of the request's tools list, forcing the model to summarise from
+// the results already injected as tool_result instead of asking for
+// another round.
+const webSearchMaxRecursionDepth = 2
 
 // newKiroWebSearchInterceptor constructs an interceptor bound to a single
 // Kiro request. The http.Client should already honour any account-specific
@@ -439,21 +439,6 @@ func (h *followUpStreamHandler) resolvePending(ctx context.Context) error {
 			"depth", h.interceptor.depth+1,
 			"at_cap", p.atDepthCap)
 
-		// If we're at the recursion cap, skip the follow-up turn and
-		// stream the raw search summary as plain text. Claude Code (or
-		// whichever client is driving) can then wrap up the
-		// conversation without hanging on a missing tool_result.
-		if p.atDepthCap {
-			h.wroteAny = true
-			if err := h.emit(&kiro.StreamEvent{
-				Kind: "content",
-				Text: kiro.FormatSearchSummary(mcpResp),
-			}); err != nil {
-				return err
-			}
-			continue
-		}
-
 		rawResultsJSON, merr := json.Marshal(mcpResp)
 		if merr != nil {
 			h.wroteAny = true
@@ -504,6 +489,17 @@ func (h *followUpStreamHandler) resolvePending(ctx context.Context) error {
 
 		nestedReq := *h.interceptor.anthReq
 		nestedReq.Messages = nestedHistory
+		// When the nested call is at the recursion cap, strip the
+		// `web_search` / `WebSearch` tool from the request so the
+		// model cannot ask for another round. It will be forced to
+		// summarise from the tool_result we just injected.
+		if p.atDepthCap {
+			nestedReq.Tools = filterOutWebSearchTools(h.interceptor.anthReq.Tools)
+			slog.Info("kiro web_search interceptor: at cap, forcing summary (web_search removed from tools)",
+				"tool_use_id", id,
+				"tools_before", len(h.interceptor.anthReq.Tools),
+				"tools_after", len(nestedReq.Tools))
+		}
 		wrote, err := childInterceptor.streamFollowUp(ctx, &nestedReq, h.emit)
 		if wrote {
 			h.wroteAny = true
@@ -674,4 +670,23 @@ func parsePageAgeToUnixMilli(s string) int64 {
 		}
 	}
 	return 0
+}
+
+
+// filterOutWebSearchTools returns a copy of tools with any
+// web_search / WebSearch entries removed. Used to force the model into
+// summarising the already-fetched search results instead of recursing
+// into yet another MCP lookup once we hit the depth cap.
+func filterOutWebSearchTools(tools []kiro.AnthropicTool) []kiro.AnthropicTool {
+	if len(tools) == 0 {
+		return nil
+	}
+	out := make([]kiro.AnthropicTool, 0, len(tools))
+	for _, t := range tools {
+		if isKiroWebSearchToolName(t.Name) {
+			continue
+		}
+		out = append(out, t)
+	}
+	return out
 }
