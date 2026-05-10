@@ -97,3 +97,38 @@ func TestThinkingSplitter_CoalescesAdjacentSegmentsInSameFeed(t *testing.T) {
 	require.Equal(t, "content", evs[4].Kind)
 	require.Equal(t, "ghi", evs[4].Text)
 }
+
+func TestThinkingSplitter_RecognisesThinkTag(t *testing.T) {
+	out := collectAll("before <think>inner thought</think> after")
+	require.Equal(t, "before  after", byKind(out, "content"))
+	require.Equal(t, "inner thought", byKind(out, "thinking"))
+}
+
+func TestThinkingSplitter_RecognisesReasoningTag(t *testing.T) {
+	out := collectAll("pre <reasoning>deliberating</reasoning> post")
+	require.Equal(t, "pre  post", byKind(out, "content"))
+	require.Equal(t, "deliberating", byKind(out, "thinking"))
+}
+
+func TestThinkingSplitter_RecognisesThoughtTag(t *testing.T) {
+	out := collectAll("<thought>idea</thought>done")
+	require.Equal(t, "done", byKind(out, "content"))
+	require.Equal(t, "idea", byKind(out, "thinking"))
+}
+
+func TestThinkingSplitter_LongerTagBeatsShorterPrefix(t *testing.T) {
+	// "<thinking>" must match before "<think>" when both exist as
+	// prefixes — otherwise "<think>ing>" would parse as "<think>" +
+	// content "ing>" which is wrong.
+	out := collectAll("<thinking>body</thinking>rest")
+	require.Equal(t, "rest", byKind(out, "content"))
+	require.Equal(t, "body", byKind(out, "thinking"))
+}
+
+func TestThinkingSplitter_MixedTagsAcrossBlocks(t *testing.T) {
+	out := collectAll(
+		"Q. <think>plan A</think> answer <thinking>deeper plan</thinking> conclusion.",
+	)
+	require.Equal(t, "Q.  answer  conclusion.", byKind(out, "content"))
+	require.Equal(t, "plan Adeeper plan", byKind(out, "thinking"))
+}

@@ -276,16 +276,19 @@ func (b *BracketToolSplitter) extract(final bool) []*StreamEvent {
 				return out
 			}
 			// Keep a small safety tail in case a prefix is split across
-			// chunk boundaries (e.g. "[tool_u" + "se Bash"). Release the
-			// rest as content now.
-			keep := len(text)
-			if tail := shortestUnmatchedPrefixTail(text); tail > 0 && tail < keep {
-				keep = tail
+			// chunk boundaries (e.g. "[tool_u" + "se Bash"). Release
+			// everything else as content right now — if no tail
+			// matches, the entire buffer flushes.
+			tail := shortestUnmatchedPrefixTail(text)
+			if tail < 0 || tail > len(text) {
+				tail = 0
 			}
-			if keep < len(text) {
-				out = append(out, &StreamEvent{Kind: "content", Text: text[:len(text)-keep]})
-				b.buf.Reset()
-				b.buf.WriteString(text[len(text)-keep:])
+			if tail < len(text) {
+				out = append(out, &StreamEvent{Kind: "content", Text: text[:len(text)-tail]})
+			}
+			b.buf.Reset()
+			if tail > 0 {
+				b.buf.WriteString(text[len(text)-tail:])
 			}
 			return out
 		}

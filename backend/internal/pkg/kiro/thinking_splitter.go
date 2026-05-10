@@ -2,11 +2,20 @@ package kiro
 
 import "strings"
 
-// ThinkingSplitter converts a stream of raw assistant text — in which the
-// model may emit <thinking>...</thinking> blocks — into two logical
-// streams: thinking fragments and regular content fragments. It is
-// resilient to the thinking tags being split across chunks (a common
-// occurrence with streaming token-level output).
+// ThinkingSplitter converts a stream of raw assistant text into two
+// logical streams: thinking fragments and regular content fragments. It
+// recognises the four canonical opening tags used by different Kiro
+// model variants:
+//
+//	<thinking>...</thinking>
+//	<think>...</think>
+//	<reasoning>...</reasoning>
+//	<thought>...</thought>
+//
+// Any of those opens a thinking block; the matching `</tag>` closes it.
+// Nested or malformed tags are treated as plain content. The splitter is
+// resilient to tags split across chunks — a common occurrence with
+// streaming token-level output.
 //
 // Usage:
 //
@@ -18,51 +27,47 @@ import "strings"
 //	}
 //	for _, ev := range s.Flush() { enc.Emit(ev) } // on EOF
 //
-// The splitter recognises the literal ASCII tags "<thinking>" and
-// "</thinking>". Nested or malformed tags are treated as plain content.
-//
 // Hard cut-off: when MaxThinkingBytes > 0, the splitter will force-close
-// a thinking block that has produced that many bytes without a
-// </thinking> tag. This guards against runaway reasoning that would
-// otherwise eat the entire output budget and leave no room for the
-// actual answer. Default of 0 disables the safeguard.
+// a thinking block that has produced that many bytes without a closing
+// tag. This guards against runaway reasoning that would otherwise eat
+// the entire output budget. Default of 0 disables the safeguard — the
+// model is expected to respect the `max_thinking_length` hint in the
+// injected preamble.
 type ThinkingSplitter struct {
-	// inThinking tracks whether the current cursor is inside a thinking
-	// block (between <thinking> and </thinking>).
 	inThinking bool
+	// closeTag is the specific closing tag we are waiting for once
+	// inThinking is true (e.g. "</think>" when the opener was "<think>").
+	closeTag string
 	// pending buffers trailing characters that could be the start of a
-	// tag boundary (e.g. we saw "<" but haven't seen enough bytes yet to
-	// know if it's "<thinking>" or something unrelated). Flushed on next
-	// Feed or on explicit Flush().
+	// tag boundary.
 	pending string
-	// MaxThinkingBytes caps the amount of raw text the splitter will
-	// keep emitting as "thinking" before force-closing the current
-	// thinking block. 0 disables the cap (historical behaviour).
+	// MaxThinkingBytes caps runaway thinking. 0 disables.
 	MaxThinkingBytes int
-	// thinkingBytes tracks how many bytes have been emitted as the
-	// current thinking block so the cap can be enforced.
-	thinkingBytes int
+	thinkingBytes    int
 }
 
-const (
-	openThinkingTag  = "<thinking>"
-	closeThinkingTag = "</thinking>"
-	// maxTagPrefix is the longest useful pending buffer: 11 chars covers
-	// both "</thinking>" and "<thinking>". Anything longer can be safely
-	// flushed as plain content.
-	maxTagPrefix = len(closeThinkingTag)
+// thinkingTagPair ties a specific opening tag to its closing tag so the
+// splitter emits balanced output regardless of which variant the model
+// chose. Order matters: the first match wins, so longer tags must come
+// before their shorter prefixes ("<thinking>" before "<think>").
+type thinkingTagPair struct {
+	open  string
+	close string
+}
 
-	// defaultThinkingByteCap is the hard byte limit for a single
-	// thinking block. Kiro's output ceiling is typically 8-16K tokens
-	// (~32-64KB). We cap thinking at 6000 bytes (~1500 tokens) so the
-	// model always has the majority of its budget for the actual answer.
-	// This value is used by DriveEventStreamToAnthropicWithInterceptor
-	// when constructing the ThinkingSplitter.
-	defaultThinkingByteCap = 6000
-)
+var thinkingTagPairs = []thinkingTagPair{
+	{open: "<thinking>", close: "</thinking>"},
+	{open: "<reasoning>", close: "</reasoning>"},
+	{open: "<thought>", close: "</thought>"},
+	{open: "<think>", close: "</think>"},
+}
 
-// Feed consumes a single chunk of assistant text and returns any emit-ready
-// StreamEvents. Either kind may be repeated, interleaved, or absent.
+// maxThinkingTagPrefix is the longest useful pending buffer length —
+// anything longer can be safely flushed as plain content.
+const maxThinkingTagPrefix = len("</thinking>")
+
+// Feed consumes a single chunk of assistant text and returns any
+// emit-ready StreamEvents.
 func (s *ThinkingSplitter) Feed(chunk string) []*StreamEvent {
 	if chunk == "" {
 		return nil
@@ -72,9 +77,7 @@ func (s *ThinkingSplitter) Feed(chunk string) []*StreamEvent {
 	return s.consume(buf, false)
 }
 
-// Flush should be called when the upstream stream ends. It releases any
-// buffered pending bytes as content/thinking events depending on the
-// current mode.
+// Flush should be called when the upstream stream ends.
 func (s *ThinkingSplitter) Flush() []*StreamEvent {
 	if s.pending == "" {
 		return nil
@@ -84,47 +87,34 @@ func (s *ThinkingSplitter) Flush() []*StreamEvent {
 	return out
 }
 
-// consume is the internal loop that repeatedly scans for the next
-// state-changing tag. When isFinal is true we never leave bytes in
-// pending — everything gets flushed as-is.
 func (s *ThinkingSplitter) consume(buf string, isFinal bool) []*StreamEvent {
 	out := make([]*StreamEvent, 0, 2)
 	for len(buf) > 0 {
 		if s.inThinking {
-			// Enforce the hard byte cap before we would emit any more
-			// thinking. Anything past the cap is forced out as content,
-			// and we flip back to "not in thinking" mode so subsequent
-			// output is plain text.
+			// Enforce the optional byte cap.
 			if s.MaxThinkingBytes > 0 && s.thinkingBytes >= s.MaxThinkingBytes {
 				s.inThinking = false
-				// Drop any remaining <thinking> closing tag inside buf
-				// if the model emits one later — we've already decided
-				// we're in content mode.
-				if idx := strings.Index(buf, closeThinkingTag); idx >= 0 {
+				closeTag := s.closeTag
+				s.closeTag = ""
+				if idx := strings.Index(buf, closeTag); idx >= 0 && closeTag != "" {
 					if idx > 0 {
 						out = appendContent(out, buf[:idx])
 					}
-					buf = buf[idx+len(closeThinkingTag):]
+					buf = buf[idx+len(closeTag):]
 					continue
 				}
 				out = appendContent(out, buf)
 				return out
 			}
-			// Look for closing tag.
-			idx := strings.Index(buf, closeThinkingTag)
+			idx := strings.Index(buf, s.closeTag)
 			if idx < 0 {
-				// No closing tag in buffer.
 				if isFinal {
 					out = appendThinking(out, buf)
 					s.thinkingBytes += len(buf)
 					return out
 				}
-				// Keep a safe tail so we don't split "</thinking>" in half.
-				safe, tail := splitOnTagBoundary(buf, closeThinkingTag)
+				safe, tail := splitOnTagBoundary(buf, s.closeTag)
 				if safe != "" {
-					// Respect the budget: if the safe portion would
-					// exceed MaxThinkingBytes, emit only the portion
-					// that fits as thinking and the rest as content.
 					if s.MaxThinkingBytes > 0 && s.thinkingBytes+len(safe) > s.MaxThinkingBytes {
 						room := s.MaxThinkingBytes - s.thinkingBytes
 						if room < 0 {
@@ -136,6 +126,7 @@ func (s *ThinkingSplitter) consume(buf string, isFinal bool) []*StreamEvent {
 						}
 						out = appendContent(out, safe[room:])
 						s.inThinking = false
+						s.closeTag = ""
 					} else {
 						out = appendThinking(out, safe)
 						s.thinkingBytes += len(safe)
@@ -148,47 +139,73 @@ func (s *ThinkingSplitter) consume(buf string, isFinal bool) []*StreamEvent {
 				out = appendThinking(out, buf[:idx])
 				s.thinkingBytes += idx
 			}
-			buf = buf[idx+len(closeThinkingTag):]
+			buf = buf[idx+len(s.closeTag):]
 			s.inThinking = false
+			s.closeTag = ""
 			continue
 		}
-		// In content mode: look for opening tag.
-		idx := strings.Index(buf, openThinkingTag)
-		if idx < 0 {
+
+		// In content mode: find the earliest opening tag among all
+		// recognised variants.
+		earliestIdx := -1
+		var matchedPair thinkingTagPair
+		for _, p := range thinkingTagPairs {
+			i := strings.Index(buf, p.open)
+			if i < 0 {
+				continue
+			}
+			if earliestIdx < 0 || i < earliestIdx {
+				earliestIdx = i
+				matchedPair = p
+			}
+		}
+		if earliestIdx < 0 {
 			if isFinal {
 				out = appendContent(out, buf)
 				return out
 			}
-			safe, tail := splitOnTagBoundary(buf, openThinkingTag)
+			// Keep a safe tail against the most ambiguous prefix — the
+			// union of all open tags' incremental prefixes. We pick the
+			// longest suffix that could start any of them.
+			safe, tail := splitOnAnyTagBoundary(buf, thinkingTagsOpenList())
 			if safe != "" {
 				out = appendContent(out, safe)
 			}
 			s.pending = tail
 			return out
 		}
-		if idx > 0 {
-			out = appendContent(out, buf[:idx])
+		if earliestIdx > 0 {
+			out = appendContent(out, buf[:earliestIdx])
 		}
-		buf = buf[idx+len(openThinkingTag):]
+		buf = buf[earliestIdx+len(matchedPair.open):]
 		s.inThinking = true
+		s.closeTag = matchedPair.close
+		s.thinkingBytes = 0
+	}
+	return out
+}
+
+// thinkingTagsOpenList returns just the opening tags for boundary-split
+// purposes. Cached trivially — the list is tiny.
+func thinkingTagsOpenList() []string {
+	out := make([]string, len(thinkingTagPairs))
+	for i, p := range thinkingTagPairs {
+		out[i] = p.open
 	}
 	return out
 }
 
 // splitOnTagBoundary returns (safeToEmit, mustKeepAsPending). The tail
-// portion is kept small — at most len(tag)-1 bytes — and is kept only
-// when the trailing bytes could plausibly be the start of tag.
+// portion is kept small — at most len(tag)-1 bytes — and only when the
+// trailing bytes could plausibly be the start of tag.
 func splitOnTagBoundary(buf, tag string) (string, string) {
 	maxKeep := len(tag) - 1
-	if maxKeep > maxTagPrefix {
-		maxKeep = maxTagPrefix
+	if maxKeep > maxThinkingTagPrefix {
+		maxKeep = maxThinkingTagPrefix
 	}
 	if maxKeep <= 0 || len(buf) == 0 {
 		return buf, ""
 	}
-	// Walk backwards from the end; keep the shortest suffix that could
-	// be the prefix of tag. For "<think" we'd keep "<think"; for a plain
-	// byte we keep nothing.
 	for keep := maxKeep; keep > 0; keep-- {
 		if keep > len(buf) {
 			continue
@@ -201,12 +218,42 @@ func splitOnTagBoundary(buf, tag string) (string, string) {
 	return buf, ""
 }
 
+// splitOnAnyTagBoundary is like splitOnTagBoundary but tries every tag
+// in the provided set and keeps the longest matching suffix so no
+// boundary is missed even with multi-tag recognition.
+func splitOnAnyTagBoundary(buf string, tags []string) (string, string) {
+	bestKeep := 0
+	for _, tag := range tags {
+		maxKeep := len(tag) - 1
+		if maxKeep > maxThinkingTagPrefix {
+			maxKeep = maxThinkingTagPrefix
+		}
+		if maxKeep <= 0 {
+			continue
+		}
+		for keep := maxKeep; keep > bestKeep; keep-- {
+			if keep > len(buf) {
+				continue
+			}
+			suffix := buf[len(buf)-keep:]
+			if strings.HasPrefix(tag, suffix) {
+				if keep > bestKeep {
+					bestKeep = keep
+				}
+				break
+			}
+		}
+	}
+	if bestKeep == 0 {
+		return buf, ""
+	}
+	return buf[:len(buf)-bestKeep], buf[len(buf)-bestKeep:]
+}
+
 func appendThinking(out []*StreamEvent, s string) []*StreamEvent {
 	if s == "" {
 		return out
 	}
-	// Coalesce with the previous thinking event if possible to keep SSE
-	// event counts sensible.
 	if n := len(out); n > 0 && out[n-1].Kind == "thinking" {
 		out[n-1].Text += s
 		return out
@@ -224,3 +271,10 @@ func appendContent(out []*StreamEvent, s string) []*StreamEvent {
 	}
 	return append(out, &StreamEvent{Kind: "content", Text: s})
 }
+
+// defaultThinkingByteCap preserved for backwards compatibility with
+// callers that configured an explicit cap. Setting this to 0 (the new
+// default) disables the cap and lets the model-side
+// `max_thinking_length` prompt handle budget control, matching how the
+// reference kiro-gateway implementation operates.
+const defaultThinkingByteCap = 0

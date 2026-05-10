@@ -70,7 +70,7 @@ func TestDriveEventStream_InterceptorSwallowsToolUseAndSubstitutesText(t *testin
 		"tool_use block leaked to client SSE")
 	require.NotContains(t, sse, "input_json_delta",
 		"partial_json leaked to client SSE")
-	require.Contains(t, sse, "[search results]")
+	require.Contains(t, reassembleTextDeltas(sse), "[search results]")
 }
 
 // TestDriveEventStream_MultipleStartFramesAccumulateInput verifies the
@@ -110,6 +110,10 @@ func TestDriveEventStream_MultipleStartFramesAccumulateInput(t *testing.T) {
 // into separate SSE thinking + text content blocks by the driver's
 // splitter, with tool_use frames still flowing through normally.
 func TestDriveEventStream_ThinkingSplitterRewritesTags(t *testing.T) {
+	orig := thinkingAsText
+	thinkingAsText = false
+	defer func() { thinkingAsText = orig }()
+
 	stream := concat(
 		testFrameJSON("assistantResponseEvent", map[string]any{
 			"content": "<thinking>plan: check docs</thinking>Here's the answer.",
@@ -129,9 +133,9 @@ func TestDriveEventStream_ThinkingSplitterRewritesTags(t *testing.T) {
 		"thinking content_block should be emitted")
 	require.Contains(t, sse, `"type":"thinking_delta"`,
 		"thinking_delta should be emitted")
-	require.Contains(t, sse, `"thinking":"plan: check docs"`)
+	require.Contains(t, reassembleThinkingDeltas(sse), "plan: check docs")
 	require.Contains(t, sse, `"type":"text"`, "text content_block should follow")
-	require.Contains(t, sse, "Here's the answer.")
+	require.Contains(t, reassembleTextDeltas(sse), "Here's the answer.")
 	require.NotContains(t, sse, "<thinking>",
 		"raw <thinking> tag must not leak to the client")
 }
@@ -158,7 +162,7 @@ func TestDriveEventStream_EOFFlushFinalisesPendingInterceptedTool(t *testing.T) 
 	require.NoError(t, enc.Finish("end_turn"))
 
 	require.Equal(t, `{"query":"x"}`, interceptor.seenInput)
-	require.Contains(t, out.String(), "[flushed]")
+	require.Contains(t, reassembleTextDeltas(out.String()), "[flushed]")
 }
 
 // TestDriveEventStream_NonMatchingInterceptorPassesThrough verifies that
@@ -244,4 +248,57 @@ func concat(chunks ...[]byte) []byte {
 		buf.Write(c)
 	}
 	return buf.Bytes()
+}
+
+// reassembleTextDeltas walks the SSE dump produced by the encoder and
+// concatenates every `text_delta` payload so tests can match against
+// the logical text independent of how the encoder sliced it into
+// frames. emitTextDeltaByRune chops long chunks into rune-sized
+// windows, so a naive `strings.Contains(sse, "<whole text>")` fails
+// even though the user sees the full string.
+func reassembleTextDeltas(sse string) string {
+	return reassembleDeltas(sse, "text_delta", "text")
+}
+
+// reassembleThinkingDeltas is the thinking-block equivalent of
+// reassembleTextDeltas.
+func reassembleThinkingDeltas(sse string) string {
+	return reassembleDeltas(sse, "thinking_delta", "thinking")
+}
+
+// reassembleDeltas scans SSE lines for `content_block_delta` frames of
+// the given delta type and returns the concatenated field value.
+func reassembleDeltas(sse, deltaType, fieldName string) string {
+	var buf bytes.Buffer
+	for _, line := range bytesSplitLines(sse) {
+		if !bytes.HasPrefix(line, []byte("data: ")) {
+			continue
+		}
+		raw := bytes.TrimPrefix(line, []byte("data: "))
+		var obj struct {
+			Type  string `json:"type"`
+			Delta struct {
+				Type     string `json:"type"`
+				Text     string `json:"text"`
+				Thinking string `json:"thinking"`
+			} `json:"delta"`
+		}
+		if err := json.Unmarshal(raw, &obj); err != nil {
+			continue
+		}
+		if obj.Type != "content_block_delta" || obj.Delta.Type != deltaType {
+			continue
+		}
+		switch fieldName {
+		case "text":
+			buf.WriteString(obj.Delta.Text)
+		case "thinking":
+			buf.WriteString(obj.Delta.Thinking)
+		}
+	}
+	return buf.String()
+}
+
+func bytesSplitLines(s string) [][]byte {
+	return bytes.Split([]byte(s), []byte("\n"))
 }

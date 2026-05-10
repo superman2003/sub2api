@@ -3,16 +3,29 @@ package kiro
 import (
 	"bytes"
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"os"
 	"strings"
+	"time"
 
 	"github.com/google/uuid"
 )
+
+// thinkingAsText controls whether thinking content is rendered as a
+// markdown blockquote (the default) versus native Anthropic
+// `thinking_delta` SSE events.
+//
+// Default: ON. Claude Code CLI with sk- API key auth does not render
+// native thinking blocks, so we ship the content as a blockquote — the
+// client's markdown renderer turns it into the familiar left-bar
+// "💭 Thinking" UI that the user wanted. Set
+// `SUB2API_KIRO_THINKING_NATIVE=1` to opt back into native thinking
+// events (useful when the client is Claude Desktop or a custom one
+// that actually renders them).
+var thinkingAsText = os.Getenv("SUB2API_KIRO_THINKING_NATIVE") == ""
 
 // AssistantEventPayload represents the JSON body of an "assistantResponseEvent"
 // frame emitted by /generateAssistantResponse.
@@ -214,6 +227,13 @@ type AnthropicSSEEncoder struct {
 	// currently active. Mutually exclusive with textBlockOpen �?switching
 	// between thinking and text closes the other block first.
 	thinkingBlockOpen bool
+	// thinkingFallbackOpen tracks whether we have emitted the opening
+	// "> **💭 Thinking**" header in thinkingAsText mode. Used by the
+	// content branch to insert a clean newline separator before regular
+	// text starts, so Claude Code's markdown renderer flushes the
+	// blockquote early and the user sees thinking → pause → answer
+	// rather than thinking and answer appearing together.
+	thinkingFallbackOpen bool
 	// thinkingBuf accumulates the raw text of the current thinking block
 	// so closeCurrentNonToolBlock can emit a stable synthetic
 	// signature_delta. Claude Code's UI silently hides thinking blocks
@@ -318,6 +338,25 @@ func (e *AnthropicSSEEncoder) Start() error {
 	return e.write("message_start", msg)
 }
 
+// mapToThinkingCapableModel is retained for completeness but unused
+// while the thinking-injection path is disabled. When Kiro exposes a
+// real thinking API (or Claude Code lifts the sk-auth rendering gate)
+// we can re-enable it inside Start() above.
+func mapToThinkingCapableModel(name string) string {
+	lower := strings.ToLower(name)
+	switch {
+	case strings.Contains(lower, "opus-4-1"):
+		return "claude-opus-4-1-20250805"
+	case strings.Contains(lower, "opus"):
+		return "claude-opus-4-1-20250805"
+	case strings.Contains(lower, "sonnet"):
+		return "claude-sonnet-4-5-20250929"
+	case strings.Contains(lower, "haiku"):
+		return "claude-haiku-4-5-20251001"
+	}
+	return name
+}
+
 // Emit forwards a single internal event.
 func (e *AnthropicSSEEncoder) Emit(ev *StreamEvent) error {
 	if err := e.Start(); err != nil {
@@ -336,6 +375,27 @@ func (e *AnthropicSSEEncoder) Emit(ev *StreamEvent) error {
 		if err := e.closeOpenToolBlocks(); err != nil {
 			return err
 		}
+		// When coming off a thinking-as-text blockquote, close the
+		// current text block and start a fresh one so Claude Code's
+		// TUI is forced to repaint: keeping thinking + answer in the
+		// same block defers the entire render to stream-end.
+		if e.thinkingFallbackOpen {
+			e.thinkingFallbackOpen = false
+			e.thinkingBuf.Reset()
+			if e.textBlockOpen {
+				if err := e.write("content_block_stop", map[string]any{
+					"type":  "content_block_stop",
+					"index": e.blockIndex,
+				}); err != nil {
+					return err
+				}
+				e.textBlockOpen = false
+				e.blockIndex++
+			}
+			if e.flush != nil {
+				e.flush()
+			}
+		}
 		if !e.textBlockOpen {
 			e.textBlockOpen = true
 			if err := e.write("content_block_start", map[string]any{
@@ -349,20 +409,53 @@ func (e *AnthropicSSEEncoder) Emit(ev *StreamEvent) error {
 				return err
 			}
 		}
-		if err := e.write("content_block_delta", map[string]any{
-			"type":  "content_block_delta",
-			"index": e.blockIndex,
-			"delta": map[string]any{
-				"type": "text_delta",
-				"text": ev.Text,
-			},
-		}); err != nil {
+		if err := e.emitTextDeltaByRune(ev.Text); err != nil {
 			return err
 		}
 		e.outputTokens += int64(len(ev.Text) / 4) // rough
 		return nil
 
 	case "thinking":
+		// When SUB2API_KIRO_THINKING_AS_TEXT is set, we surface thinking
+		// content as a regular text block prefixed with a markdown
+		// blockquote so it still looks like "thinking" in the UI. This
+		// is a pragmatic fallback for clients that don't render native
+		// thinking blocks (notably Claude Code CLI with sk- auth, where
+		// thinking is gated behind a Claude.ai subscription OAuth
+		// session).
+		if thinkingAsText {
+			rendered := renderThinkingAsQuoted(ev.Text, &e.thinkingBuf)
+			if rendered == "" {
+				return nil
+			}
+			e.thinkingFallbackOpen = true
+			// Emit directly as a text delta instead of recursing into
+			// the content case — the recursion would trip the
+			// thinkingFallbackOpen→content transition path and reset
+			// e.thinkingBuf, which makes every subsequent fragment
+			// re-emit the "💭 Thinking" header.
+			if err := e.closeOpenToolBlocks(); err != nil {
+				return err
+			}
+			if !e.textBlockOpen {
+				e.textBlockOpen = true
+				if err := e.write("content_block_start", map[string]any{
+					"type":  "content_block_start",
+					"index": e.blockIndex,
+					"content_block": map[string]any{
+						"type": "text",
+						"text": "",
+					},
+				}); err != nil {
+					return err
+				}
+			}
+			if err := e.emitTextDeltaByRune(rendered); err != nil {
+				return err
+			}
+			e.outputTokens += int64(len(rendered) / 4)
+			return nil
+		}
 		if e.textBlockOpen {
 			if err := e.closeCurrentNonToolBlock(); err != nil {
 				return err
@@ -373,6 +466,13 @@ func (e *AnthropicSSEEncoder) Emit(ev *StreamEvent) error {
 		}
 		if !e.thinkingBlockOpen {
 			e.thinkingBlockOpen = true
+			// Anthropic's streaming wire format requires an empty
+			// signature in content_block_start; the real signature
+			// arrives in a trailing signature_delta just before
+			// content_block_stop (see closeCurrentNonToolBlock).
+			// Putting the signature in the start event instead causes
+			// Claude Code to acknowledge the thinking block exists but
+			// refuse to render its body.
 			if err := e.write("content_block_start", map[string]any{
 				"type":  "content_block_start",
 				"index": e.blockIndex,
@@ -482,13 +582,13 @@ func (e *AnthropicSSEEncoder) closeCurrentNonToolBlock() error {
 	if !e.textBlockOpen && !e.thinkingBlockOpen {
 		return nil
 	}
-	// Emit a synthetic signature before closing a thinking block. Claude
-	// Code's UI hides thinking blocks that finish without a signature,
-	// so we produce a stable, self-derived value. Genuine Anthropic
-	// signatures are server-signed base64 blobs; our synthetic one is
-	// clearly marked so downstream consumers can distinguish them.
+	// Anthropic thinking blocks must close with a signature_delta
+	// carrying the "signature" field. Claude Code's UI buffers the
+	// thinking_delta events and waits for this signature before
+	// rendering the block body — without it the block appears in the
+	// state indicator but the contents stay hidden.
 	if e.thinkingBlockOpen {
-		sig := syntheticThinkingSignature(e.thinkingBuf.String())
+		sig := syntheticThinkingSignature()
 		if err := e.write("content_block_delta", map[string]any{
 			"type":  "content_block_delta",
 			"index": e.blockIndex,
@@ -513,14 +613,20 @@ func (e *AnthropicSSEEncoder) closeCurrentNonToolBlock() error {
 	return nil
 }
 
-// syntheticThinkingSignature derives a stable identifier for a thinking
-// block. Anthropic's native signatures are server-signed; we can't forge
-// those, but any non-empty signature is enough to keep Claude Code's UI
-// from hiding the block. The prefix makes it clear the signature is
-// gateway-synthesised and not from Anthropic.
-func syntheticThinkingSignature(thinking string) string {
-	sum := sha256.Sum256([]byte(thinking))
-	return "sub2api-kiro-emulated:" + hex.EncodeToString(sum[:16])
+// syntheticThinkingSignature returns a placeholder signature string for a
+// thinking content block. Anthropic's native signatures are server-signed
+// cryptographic blobs; we cannot forge those, but Claude Code and the
+// other clients we target do not actually verify them — they only check
+// that a non-empty, unique-ish signature is present. The shape
+// `sig_<32hex>` matches what jwadow/kiro-gateway ships and has been
+// confirmed to render fine in Claude Code.
+//
+// We seed with a per-block UUID (not a hash of the body) so two thinking
+// blocks in the same stream get different signatures, matching how real
+// Anthropic thinking blocks behave and avoiding any deduplication the
+// client might apply when two blocks share a signature.
+func syntheticThinkingSignature() string {
+	return "sig_" + strings.ReplaceAll(uuid.NewString(), "-", "")
 }
 
 // closeOpenToolBlocks flushes every pending tool_use that has not yet
@@ -1299,7 +1405,7 @@ func (b *AnthropicNonStreamBuilder) Finish(stopReason string) ([]byte, error) {
 			content = append(content, map[string]any{
 				"type":      "thinking",
 				"thinking":  blk.thinking,
-				"signature": syntheticThinkingSignature(blk.thinking),
+				"signature": syntheticThinkingSignature(),
 			})
 		case "tool_use":
 			// Parse accumulated partial_json into a concrete input object
@@ -1570,4 +1676,136 @@ func finalToolInput(p *interceptorPending) string {
 		return p.finalInput
 	}
 	return p.input.String()
+}
+
+
+// renderThinkingAsQuoted converts a raw thinking fragment into
+// display-ready text for the SUB2API_KIRO_THINKING_AS_TEXT fallback.
+// We deliberately use plain ASCII dividers + a visible tag rather than
+// markdown blockquote (`> `) because Claude Code's renderer buffers
+// blockquote lines until a terminating blank line arrives — that makes
+// the whole thinking section appear to land in a single "batch" at the
+// same moment the final answer renders, which defeats the purpose of
+// streaming the thinking at all.
+//
+// Streaming-friendly layout:
+//
+//	━━━ 💭 Thinking ━━━
+//	...streaming thinking text unchanged...
+//	━━━ 💬 Answer ━━━
+//	...final answer...
+//
+// seenBuf carries insertion state across fragments so we only emit the
+// header once per block. AnthropicSSEEncoder resets it via
+// closeCurrentNonToolBlock when the thinking block ends, at which
+// point we also emit the trailing divider.
+// renderThinkingAsQuoted converts a raw thinking fragment into markdown
+// blockquote text. Claude Code's markdown renderer turns lines prefixed
+// with `> ` into a left-bar quote, which looks exactly like a "💭
+// Thinking" UI widget — this is the rendering the user expects when
+// thinking is enabled.
+//
+// We emit a one-time header on the very first fragment, then prefix
+// every subsequent line start with `> ` so the whole thinking section
+// shows as one continuous quote. seenBuf tracks insertion state across
+// streaming fragments and is reset by the encoder when the thinking
+// block ends.
+func renderThinkingAsQuoted(raw string, seenBuf *strings.Builder) string {
+	if raw == "" {
+		return ""
+	}
+	var b strings.Builder
+	startOfBlock := seenBuf.Len() == 0
+	if startOfBlock {
+		b.WriteString("\n> **💭 Thinking**\n> \n> ")
+	}
+	// Track whether the last char in seenBuf was a newline so the next
+	// fragment's first character gets a "> " marker.
+	lastWasNewline := false
+	if seenBuf.Len() > 0 {
+		s := seenBuf.String()
+		lastWasNewline = s[len(s)-1] == '\n'
+	}
+	for _, ch := range raw {
+		if lastWasNewline && ch != '\n' {
+			b.WriteString("> ")
+			lastWasNewline = false
+		}
+		b.WriteRune(ch)
+		if ch == '\n' {
+			lastWasNewline = true
+		}
+	}
+	seenBuf.WriteString(raw)
+	return b.String()
+}
+
+
+// textDeltaRunesPerFrame controls how many unicode runes are packed
+// into a single text_delta SSE event. Small chunks are reassembled by
+// Claude Code into its own animation frames, so we don't need to be
+// aggressive — 3 runes per frame keeps SSE overhead sane while still
+// giving the client plenty of deltas to animate.
+const textDeltaRunesPerFrame = 3
+
+// textDeltaFrameInterval is the wall-clock gap between successive
+// rune-level frames. Kept tiny so we don't artificially slow down the
+// response when the client is capable of rendering fast.
+const textDeltaFrameInterval = 0
+
+// emitTextDeltaByRune splits a text chunk into rune-sized windows and
+// emits each as its own content_block_delta SSE event. This keeps the
+// client-side typing animation smooth even when Kiro sends big chunks
+// (newline boundaries, markdown tables, …).
+//
+// Runs of pure ASCII whitespace and unicode whitespace at the start of
+// a chunk are coalesced with the first visible window so we do not
+// emit dozens of "invisible" frames at the beginning of a line.
+func (e *AnthropicSSEEncoder) emitTextDeltaByRune(text string) error {
+	if text == "" {
+		return nil
+	}
+	runes := []rune(text)
+	// Fast path: short strings are emitted in one shot — splitting
+	// would only add latency.
+	if len(runes) <= textDeltaRunesPerFrame {
+		return e.writeTextDelta(text)
+	}
+	for i := 0; i < len(runes); i += textDeltaRunesPerFrame {
+		end := i + textDeltaRunesPerFrame
+		if end > len(runes) {
+			end = len(runes)
+		}
+		frame := string(runes[i:end])
+		if err := e.writeTextDelta(frame); err != nil {
+			return err
+		}
+		if end < len(runes) {
+			time.Sleep(textDeltaFrameInterval)
+		}
+	}
+	return nil
+}
+
+// writeTextDelta emits a single text_delta frame and forces an SSE
+// flush so the byte actually lands in the client's socket buffer
+// instead of sitting in the encoder's write buffer until the next call.
+func (e *AnthropicSSEEncoder) writeTextDelta(s string) error {
+	if s == "" {
+		return nil
+	}
+	if err := e.write("content_block_delta", map[string]any{
+		"type":  "content_block_delta",
+		"index": e.blockIndex,
+		"delta": map[string]any{
+			"type": "text_delta",
+			"text": s,
+		},
+	}); err != nil {
+		return err
+	}
+	if e.flush != nil {
+		e.flush()
+	}
+	return nil
 }

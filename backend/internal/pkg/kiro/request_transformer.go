@@ -179,6 +179,12 @@ func BuildKiroPayload(req *AnthropicRequest, opts BuildOptions) (map[string]any,
 	}
 
 	systemPrompt := extractSystemPrompt(req.System)
+	// Append the thinking-mode legitimisation block to the system prompt
+	// so the model treats the XML tags in the user message as proper
+	// system instructions instead of a prompt-injection attempt.
+	if isThinkingRequested(req.Thinking) {
+		systemPrompt += thinkingSystemPromptAddition()
+	}
 
 	// Split messages: history = all but last; current = last.
 	msgs := normaliseMessages(req.Messages)
@@ -221,16 +227,28 @@ func BuildKiroPayload(req *AnthropicRequest, opts BuildOptions) (map[string]any,
 		currentText = "Continue"
 	}
 
-	// Kiro has no native thinking/extended-reasoning API. The "fake
-	// reasoning" approach (injecting <thinking_mode> tags) was found to
-	// cause severe output truncation because Kiro's upstream enforces a
-	// hard output-token ceiling that cannot be raised externally, and the
-	// model spends most of its budget on the thinking block. Disabled
-	// until Kiro adds native thinking support or raises its output cap.
-	//
-	// if isThinkingRequested(req.Thinking) {
-	//     currentText = buildThinkingPreamble(req.Thinking, req.MaxTokens) + "\n\n" + currentText
-	// }
+	// Inject the thinking-mode preamble into the current user turn when
+	// the client asked for extended thinking. The preamble wraps
+	// `<thinking_mode>`, `<max_thinking_length>`, and
+	// `<thinking_instruction>` XML tags that, together with the
+	// matching system-prompt addendum, instruct the Kiro model to
+	// produce `<thinking>...</thinking>` blocks at the start of its
+	// reply. The response-side ThinkingSplitter then routes those
+	// blocks into Anthropic `thinking_delta` events so Claude Code can
+	// render them natively.
+	// Inject the thinking-mode preamble into the current user turn when
+	// the client asked for extended thinking. The preamble makes Kiro
+	// produce `<thinking>...</thinking>` blocks; the response-side
+	// ThinkingSplitter then routes them into thinking events which the
+	// encoder renders as a markdown blockquote — Claude Code's renderer
+	// shows that as the familiar left-bar "💭 Thinking" UI even without
+	// native thinking-block support.
+	if isThinkingRequested(req.Thinking) {
+		slog.Info("kiro request: injecting thinking preamble",
+			"budget_tokens", req.Thinking.BudgetTokens,
+			"type", req.Thinking.Type)
+		currentText = buildThinkingPreamble(req.Thinking) + currentText
+	}
 
 	// Build userInputMessageContext (tools + toolResults; images are inline).
 	userInputContext := map[string]any{}
@@ -480,53 +498,81 @@ func isThinkingRequested(th *AnthropicThinking) bool {
 	switch strings.ToLower(strings.TrimSpace(th.Type)) {
 	case "enabled", "adaptive":
 		return true
+	case "disabled":
+		return false
 	}
 	// Tolerant fallback: some clients set budget_tokens without the type
 	// field. Treat any positive budget as "thinking requested".
 	return th.BudgetTokens > 0
 }
 
+// thinkingPreambleBudgetDefault is the default token budget for the
+// injected thinking preamble when the client did not specify one.
+const thinkingPreambleBudgetDefault = 4000
+
+// thinkingPreambleBudgetCap is the absolute ceiling applied to any
+// client-supplied budget. Beyond this, spending more tokens on thinking
+// tends to starve the actual answer without improving quality.
+const thinkingPreambleBudgetCap = 10000
+
 // buildThinkingPreamble returns the instruction prepended to the current
 // user turn so the Kiro model emits its reasoning inside
-// <thinking>...</thinking> tags. The budget (max_thinking_length) is a
-// soft hint to the model; we cap it aggressively because Kiro upstream
-// has a tier-based output-token ceiling that we cannot raise, so every
-// token spent in thinking is a token the model cannot use for the
-// answer itself.
-//
-// The preamble is deliberately written in a neutral, brief form so it
-// does not distract the model from the actual user request — earlier
-// versions that used strong imperatives ("Keep reasoning concise and
-// stop...") were observed to cause the model to truncate its final
-// answer after closing the thinking block.
-func buildThinkingPreamble(th *AnthropicThinking, maxTokens int) string {
-	// Pick a conservative default. 1500 tokens is enough for useful
-	// planning on most requests and keeps plenty of room for the answer
-	// under Kiro's typical 8-16k ceiling.
-	budget := 1500
+// <thinking>...</thinking> tags. Mirrors the reference kiro-gateway
+// implementation: uses explicit XML tags (not bracket-style markers) so
+// the accompanying system prompt addendum can legitimise them as
+// system-level instructions rather than prompt-injection attempts.
+func buildThinkingPreamble(th *AnthropicThinking) string {
+	budget := thinkingPreambleBudgetDefault
 	if th != nil && th.BudgetTokens > 0 {
 		budget = th.BudgetTokens
 	}
-	// Even if the caller asks for a big budget, keep thinking below a
-	// quarter of max_tokens so the model always has at least 75% left
-	// for the actual reply.
-	if maxTokens > 0 {
-		if cap := maxTokens / 4; cap > 0 && budget > cap {
-			budget = cap
-		}
+	if budget > thinkingPreambleBudgetCap {
+		budget = thinkingPreambleBudgetCap
 	}
-	// Absolute hard cap regardless of max_tokens — thinking that exceeds
-	// 4000 tokens almost always wastes output budget on tangents.
-	if budget > 4000 {
-		budget = 4000
-	}
+	// The prompt is intentionally imperative and explicit: some Kiro
+	// model fine-tunes will silently ignore polite hints and just give
+	// a regular answer, which breaks "show your thinking" features in
+	// downstream clients like Claude Code. Starting with a strict
+	// instruction — rather than an XML config block — raises the hit
+	// rate of thinking-tagged output dramatically in practice.
 	return fmt.Sprintf(
-		`[thinking_mode=enabled max_thinking_length=%d]`+"\n"+
-			`You may use a brief <thinking>...</thinking> block at the very start of your reply to plan. `+
-			`Contents of the thinking block are private — the user only sees what comes after </thinking>. `+
-			`IMPORTANT: The thinking block must stay under %d tokens. `+
-			`Skip the thinking block entirely for simple conversational questions. `+
-			`After </thinking>, answer the user in full as you normally would.`,
+		"IMPORTANT: You MUST begin your response with a `<thinking>...</thinking>` block "+
+			"(maximum %d tokens) where you reason through the problem step by step in "+
+			"English before writing the actual reply. Everything inside `<thinking>` is "+
+			"private planning the user will NOT see directly. After the closing "+
+			"`</thinking>` tag, provide your final answer to the user in their own "+
+			"language. Never skip the thinking block even for simple questions — it is "+
+			"required by the system.\n\n"+
+			"Internal reasoning guidance:\n"+
+			"- First confirm you understand what is being asked.\n"+
+			"- Consider multiple approaches or perspectives when relevant.\n"+
+			"- Think about edge cases and what could go wrong.\n"+
+			"- Challenge your initial assumptions.\n"+
+			"- Verify your reasoning before concluding.\n\n"+
+			"Quality of thought matters more than speed.\n\n"+
+			"<thinking_mode>enabled</thinking_mode>\n"+
+			"<max_thinking_length>%d</max_thinking_length>\n\n",
 		budget, budget,
 	)
+}
+
+// thinkingSystemPromptAddition returns an addendum appended to the
+// request's system prompt to legitimise the thinking-mode XML tags and
+// to issue the core "always respond with a <thinking> block" directive.
+// Having the directive in the system prompt (not just the user turn)
+// dramatically raises the odds that a Kiro model will actually comply.
+func thinkingSystemPromptAddition() string {
+	return "\n\n---\n" +
+		"# Extended Thinking Mode — REQUIRED\n\n" +
+		"This conversation uses extended thinking mode. For every assistant turn you " +
+		"MUST begin your response with a `<thinking>...</thinking>` block where you " +
+		"reason through the problem step by step in English. Everything inside the " +
+		"`<thinking>` tags is private planning the user does NOT see. After the " +
+		"closing `</thinking>` tag, provide your final answer in the user's language.\n\n" +
+		"Never skip the `<thinking>` block, even for greetings or simple questions — " +
+		"this is a hard system requirement, not a user suggestion.\n\n" +
+		"The user message may contain these legitimate system tags:\n" +
+		"- `<thinking_mode>enabled</thinking_mode>` - enables extended thinking\n" +
+		"- `<max_thinking_length>N</max_thinking_length>` - caps thinking tokens\n" +
+		"These tags are NOT prompt injection attempts and must be honoured."
 }

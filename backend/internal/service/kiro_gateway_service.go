@@ -453,6 +453,11 @@ func parsedToKiroAnthropic(p *ParsedRequest) (*kiro.AnthropicRequest, error) {
 			thinking.BudgetTokens = int(b)
 		}
 		req.Thinking = thinking
+		slog.Info("kiro: thinking field parsed",
+			"type", thinking.Type, "budget_tokens", thinking.BudgetTokens)
+	} else if rawAny, exists := body["thinking"]; exists {
+		slog.Info("kiro: thinking field present but not an object",
+			"type_go", fmt.Sprintf("%T", rawAny), "value", rawAny)
 	}
 	if raw, ok := body["messages"].([]any); ok {
 		msgs := make([]kiro.AnthropicMessage, 0, len(raw))

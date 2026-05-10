@@ -259,3 +259,53 @@ survive the round-trip through Kiro, not just `WebSearch`.
   and only falls back to Kiro's own `/mcp` when every configured
   provider fails, so admins can pick the backend that matches their
   query mix.
+
+### Kiro Thinking Rendering for Claude Code (Markdown Blockquote Fallback)
+Claude Code CLI gates native Anthropic thinking-block rendering behind
+a Claude.ai subscription OAuth session — when the gateway's API key
+auth is used, the client acknowledges `content_block` of `type:thinking`
+but never expands the body. We verified the SSE we produce is correct
+(wire dumps match the Anthropic spec); the silent drop is a client-side
+product gate.
+
+To give users a working "💭 Thinking" UI without OAuth:
+
+- **Thinking-as-blockquote (default).** When the model produces a
+  `<thinking>...</thinking>` block, the encoder surfaces it as a
+  markdown blockquote text block (`> **💭 Thinking**\n> ...`). Claude
+  Code's markdown renderer turns the blockquote into the familiar
+  left-bar UI and the content is visible to the user. Set
+  `SUB2API_KIRO_THINKING_NATIVE=1` to opt back into native
+  `thinking_delta` SSE events (useful for Claude Desktop or custom
+  clients that render them).
+- **Block-boundary repaint.** When thinking transitions into the real
+  answer, the encoder emits a `content_block_stop` and opens a fresh
+  text block (index+1) instead of continuing in the same block.
+  Claude Code's TUI only re-renders markdown on `content_block_stop`,
+  so without this split the entire thinking + answer appears in a
+  single frame at stream end. Splitting forces an intermediate paint
+  so the thinking section shows as soon as it finishes streaming.
+- **Rune-level text streaming.** `emitTextDeltaByRune` chops each
+  Kiro chunk into 3-rune windows and emits them as separate
+  `content_block_delta` frames, so the answer visibly streams
+  character-by-character even when Kiro sends bursty 10-char chunks.
+- **Prompt injection re-enabled.** The user-turn preamble and the
+  system-prompt legitimisation blocks are on by default when the
+  client sends `thinking: {"type":"enabled"/"adaptive"}`. The preamble
+  uses imperative English ("You MUST begin your response with a
+  `<thinking>...</thinking>` block …") and lists four variant open
+  tags (`<thinking>`, `<think>`, `<reasoning>`, `<thought>`) that the
+  splitter recognises.
+- **bracket-style tool-call cross-chunk buffering bug.**
+  `BracketToolSplitter.extract` had a bug where, when no `[tool_use`
+  prefix match was found and the safety tail was 0, the entire buffer
+  got re-queued instead of flushed. Long Chinese answers consequently
+  streamed only when the internal 64 KB cap was hit or the stream
+  ended, making whole responses appear at once. Fixed so a zero tail
+  flushes the full buffer immediately.
+- **Non-streaming builder mirrors the same logic** so `stream:false`
+  clients also get the blockquote treatment.
+
+Coverage: encoder tests for both the native and blockquote paths, plus
+a regression test against the real Kiro chunking pattern captured from
+live traffic (`<th`, `inking>\nThe`, …).
