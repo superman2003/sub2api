@@ -32,9 +32,22 @@ type TokenRefreshService struct {
 	privacyClientFactory PrivacyClientFactory
 	proxyRepo            ProxyRepository
 
+	// kiroAccountProbe lets the background refresher verify a seemingly
+	// dead Kiro account before parking it as temp-unschedulable. Many
+	// refresh failures are transient (AWS 5xx, network blip) and the
+	// account is still perfectly usable. When the probe succeeds after
+	// refresh retries are exhausted, we skip the park.
+	kiroAccountProbe KiroAccountProbe
+
 	stopCh   chan struct{}
 	stopOnce sync.Once
 	wg       sync.WaitGroup
+}
+
+// SetKiroAccountProbe wires a live-probe implementation for Kiro accounts.
+// Has no effect on other platforms' refresh paths.
+func (s *TokenRefreshService) SetKiroAccountProbe(probe KiroAccountProbe) {
+	s.kiroAccountProbe = probe
 }
 
 // NewTokenRefreshService 创建token刷新服务
@@ -327,6 +340,28 @@ func (s *TokenRefreshService) refreshWithRetry(ctx context.Context, account *Acc
 	// 刷新失败但 access_token 可能仍有效，尝试设置隐私
 	s.ensureOpenAIPrivacy(ctx, account)
 	s.ensureAntigravityPrivacy(ctx, account)
+
+	// For Kiro accounts, run a live probe before parking. Refresh
+	// failures are frequently transient (AWS 5xx, network blip); if the
+	// account actually still answers, skip temp-unsched so the user
+	// does not see "no available accounts" while manual tests work.
+	if account.Platform == PlatformKiro && s.kiroAccountProbe != nil {
+		probeCtx, probeCancel := context.WithTimeout(ctx, 20*time.Second)
+		defer probeCancel()
+		if probeErr := s.kiroAccountProbe.ProbeAccount(probeCtx, account); probeErr == nil {
+			slog.Info("token_refresh.kiro_probe_ok_skip_temp_unsched",
+				"account_id", account.ID,
+				"refresh_error", lastErr,
+			)
+			return lastErr
+		} else {
+			slog.Warn("token_refresh.kiro_probe_failed_proceed_temp_unsched",
+				"account_id", account.ID,
+				"refresh_error", lastErr,
+				"probe_error", probeErr,
+			)
+		}
+	}
 
 	// 设置临时不可调度 10 分钟（不标记 error，保持 status=active 让下个刷新周期能继续尝试）
 	until := time.Now().Add(tokenRefreshTempUnschedDuration)

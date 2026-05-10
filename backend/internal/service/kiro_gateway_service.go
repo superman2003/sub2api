@@ -703,3 +703,74 @@ func parseNonNegativeInt(s string) (int, error) {
 	}
 	return n, nil
 }
+
+
+// ProbeAccount sends a minimal /generateAssistantResponse request to Kiro
+// using the account's current credentials and returns nil iff the upstream
+// accepts the call (HTTP 2xx + non-error first frame). It does NOT write
+// any response to a client — it is intended for background health checks
+// that need to know "is this account actually usable right now?" without
+// the side-effect of streaming data to a user.
+//
+// Used by the temp-unschedulable guards (KiroTokenProvider,
+// TokenRefreshService): instead of blindly parking the account on the
+// first refresh or request failure we probe here; only a failed probe
+// triggers the stall. This fixes the case where a transient request
+// error would otherwise sideline an account the user can still use.
+func (s *KiroGatewayService) ProbeAccount(ctx context.Context, account *Account) error {
+	if s == nil || account == nil {
+		return errors.New("kiro probe: nil receiver or account")
+	}
+	token, err := s.tokenProvider.GetAccessToken(ctx, account)
+	if err != nil {
+		return fmt.Errorf("kiro probe: token: %w", err)
+	}
+	profileArn := s.tokenProvider.ProfileArn(account)
+	mapping := kiroModelMappingForAccount(account)
+
+	// Minimal payload — one-token ask, no tools, no streaming control.
+	userContent, _ := json.Marshal([]map[string]any{{"type": "text", "text": "hi"}})
+	anthReq := &kiro.AnthropicRequest{
+		Model:     "claude-sonnet-4.5",
+		MaxTokens: 8,
+		Stream:    true,
+		Messages:  []kiro.AnthropicMessage{{Role: "user", Content: userContent}},
+	}
+	payload, err := kiro.BuildKiroPayload(anthReq, kiro.BuildOptions{
+		ProfileArn:   profileArn,
+		ModelMapping: mapping,
+	})
+	if err != nil {
+		return fmt.Errorf("kiro probe: build payload: %w", err)
+	}
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return fmt.Errorf("kiro probe: marshal payload: %w", err)
+	}
+
+	probeCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(probeCtx, http.MethodPost, kiroUpstreamEndpoint, bytes.NewReader(body))
+	if err != nil {
+		return fmt.Errorf("kiro probe: build request: %w", err)
+	}
+	req.Header = kiroUpstreamHeaders(token)
+
+	client := s.clientForAccount(account)
+	resp, err := client.Do(req)
+	if err != nil {
+		return fmt.Errorf("kiro probe: http do: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 4*1024))
+		return fmt.Errorf("kiro probe: status %d: %s", resp.StatusCode, string(raw))
+	}
+
+	// Drain a tiny prefix so the connection returns to the pool cleanly
+	// but we don't waste bandwidth reading the full answer.
+	_, _ = io.CopyN(io.Discard, resp.Body, 4*1024)
+	return nil
+}

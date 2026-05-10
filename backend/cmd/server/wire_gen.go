@@ -191,6 +191,47 @@ func initializeApplication(buildInfo handler.BuildInfo) (*Application, error) {
 	// are now instantiated so it is safe to wire them together without cycles.
 	kiroGatewayService.SetWebSearchDeps(channelService)
 	kiroGatewayService.SetWebSearchMCPCache(redisClient)
+	// Give the Kiro token provider a live-probe hook so hot-path refresh
+	// failures no longer blindly park the account — if the probe still
+	// succeeds (common: transient AWS 5xx, network blip) we skip the park.
+	kiroTokenProvider.SetAccountProbe(kiroGatewayService)
+	// One-time bootstrap: clear any stale soft-suspension flags on Kiro
+	// accounts left behind by earlier builds — they used to park an
+	// account on every refresh blip or transient 5xx. From this version
+	// on we probe before parking, so the legacy flags should be wiped
+	// so previously-parked-but-actually-healthy accounts go back into
+	// the pool immediately after an upgrade.
+	//
+	// We clear three soft flags here (all reversible, none deletes
+	// credentials): temp_unschedulable_until, rate_limit_reset_at,
+	// overload_until. Accounts that still genuinely fail will pick the
+	// right state up again on the very next request.
+	if kiroAccounts, lerr := accountRepository.ListByPlatform(context.Background(), service.PlatformKiro); lerr == nil {
+		var clearedUnsched, clearedRate int
+		now := time.Now()
+		for i := range kiroAccounts {
+			acc := &kiroAccounts[i]
+			if acc.TempUnschedulableUntil != nil && acc.TempUnschedulableUntil.After(now) {
+				if err := accountRepository.ClearTempUnschedulable(context.Background(), acc.ID); err == nil {
+					clearedUnsched++
+				}
+			}
+			// ClearRateLimit also clears temp_unschedulable_until as a
+			// side-effect, but we call it unconditionally on Kiro
+			// accounts with an active rate_limit_reset_at so stale
+			// rate-limit windows from earlier builds don't keep the
+			// account out of the pool.
+			if acc.RateLimitResetAt != nil && acc.RateLimitResetAt.After(now) {
+				if err := accountRepository.ClearRateLimit(context.Background(), acc.ID); err == nil {
+					clearedRate++
+				}
+			}
+		}
+		if clearedUnsched > 0 || clearedRate > 0 {
+			log.Printf("startup.kiro.soft_flags_cleared temp_unsched=%d rate_limit=%d (legacy flags from pre-probe builds)",
+				clearedUnsched, clearedRate)
+		}
+	}
 	modelPricingResolver := service.NewModelPricingResolver(channelService, billingService)
 	balanceNotifyService := service.ProvideBalanceNotifyService(emailService, settingRepository, accountRepository)
 	gatewayService := service.NewGatewayService(accountRepository, groupRepository, usageLogRepository, usageBillingRepository, userRepository, userSubscriptionRepository, userGroupRateRepository, gatewayCache, configConfig, schedulerSnapshotService, concurrencyService, billingService, rateLimitService, billingCacheService, identityService, httpUpstream, deferredService, claudeTokenProvider, sessionLimitCache, rpmCache, digestSessionStore, settingService, tlsFingerprintProfileService, channelService, modelPricingResolver, balanceNotifyService)
@@ -270,6 +311,10 @@ func initializeApplication(buildInfo handler.BuildInfo) (*Application, error) {
 	opsCleanupService := service.ProvideOpsCleanupService(opsRepository, db, redisClient, configConfig, channelMonitorService, settingRepository, opsService)
 	opsScheduledReportService := service.ProvideOpsScheduledReportService(opsService, userService, emailService, redisClient, configConfig)
 	tokenRefreshService := service.ProvideTokenRefreshService(accountRepository, oAuthService, openAIOAuthService, geminiOAuthService, antigravityOAuthService, kiroOAuthService, compositeTokenCacheInvalidator, schedulerCache, configConfig, tempUnschedCache, privacyClientFactory, proxyRepository, oAuthRefreshAPI)
+	// Same live-probe guard as above, but for the background refresh
+	// loop: only park a Kiro account as temp-unschedulable after retry
+	// exhaustion IF a probe also fails.
+	tokenRefreshService.SetKiroAccountProbe(kiroGatewayService)
 	accountExpiryService := service.ProvideAccountExpiryService(accountRepository)
 	subscriptionExpiryService := service.ProvideSubscriptionExpiryService(userSubscriptionRepository)
 	scheduledTestRunnerService := service.ProvideScheduledTestRunnerService(scheduledTestPlanRepository, scheduledTestService, accountTestService, rateLimitService, configConfig)

@@ -36,7 +36,21 @@ type KiroTokenProvider struct {
 	executor         OAuthRefreshExecutor
 	refreshPolicy    ProviderRefreshPolicy
 	tempUnschedCache TempUnschedCache
+	// accountProbe lets the provider confirm an account is actually dead
+	// before stalling it. Refreshes fail for transient reasons all the
+	// time (network blip, AWS 5xx, context deadline) — parking the
+	// account on every such blip produces the user-reported "no
+	// available accounts" even though a manual test still works. When
+	// set, markTempUnschedulable runs a live probe first and only
+	// parks the account if the probe also fails.
+	accountProbe     KiroAccountProbe
 	backfillCooldown sync.Map
+}
+
+// KiroAccountProbe verifies an account is actually usable at the moment.
+// nil error means the account can serve requests right now.
+type KiroAccountProbe interface {
+	ProbeAccount(ctx context.Context, account *Account) error
 }
 
 // NewKiroTokenProvider constructs the provider with sensible defaults.
@@ -68,6 +82,16 @@ func (p *KiroTokenProvider) SetRefreshPolicy(policy ProviderRefreshPolicy) {
 // from scheduling consideration, without waiting for the next DB sweep.
 func (p *KiroTokenProvider) SetTempUnschedCache(cache TempUnschedCache) {
 	p.tempUnschedCache = cache
+}
+
+// SetAccountProbe wires a live-probe implementation. When set, the
+// provider will verify a seemingly-dead account is actually dead before
+// flipping it to temp-unschedulable — refreshes fail for transient
+// reasons (network blip, AWS 5xx) all the time, and parking the
+// account on every blip leads to "no available accounts" errors even
+// when the account is usable.
+func (p *KiroTokenProvider) SetAccountProbe(probe KiroAccountProbe) {
+	p.accountProbe = probe
 }
 
 // GetAccessToken returns a Kiro accessToken that is valid for at least
@@ -166,9 +190,32 @@ func (p *KiroTokenProvider) ProfileArn(account *Account) string {
 
 // markTempUnschedulable parks the account when hot-path refresh fails so the
 // scheduler skips it until the background service recovers.
+//
+// Before actually parking, we run a live probe (if configured): lots of
+// refresh errors are transient (network blip, AWS 5xx bursts, context
+// deadline under load) and the account is still perfectly usable. If
+// the probe succeeds, we log and skip the park entirely — the scheduler
+// keeps the account in the pool and the next request just works.
 func (p *KiroTokenProvider) markTempUnschedulable(account *Account, refreshErr error) {
 	if p.accountRepo == nil || account == nil {
 		return
+	}
+	if p.accountProbe != nil {
+		probeCtx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+		defer cancel()
+		if err := p.accountProbe.ProbeAccount(probeCtx, account); err == nil {
+			slog.Info("kiro_token_provider.probe_ok_skip_temp_unsched",
+				"account_id", account.ID,
+				"refresh_error", refreshErr.Error(),
+			)
+			return
+		} else {
+			slog.Warn("kiro_token_provider.probe_failed_proceed_temp_unsched",
+				"account_id", account.ID,
+				"refresh_error", refreshErr.Error(),
+				"probe_error", err.Error(),
+			)
+		}
 	}
 	now := time.Now()
 	until := now.Add(tokenRefreshTempUnschedDuration)
