@@ -740,7 +740,7 @@ func OpsErrorLoggerMiddleware(ops *service.OpsService) gin.HandlerFunc {
 		}
 
 		// Skip logging if the error should be filtered based on settings
-		if shouldSkipOpsErrorLog(c.Request.Context(), ops, parsed.Message, string(body), c.Request.URL.Path) {
+		if shouldSkipOpsErrorLog(c.Request.Context(), ops, parsed.Message, string(body), c.Request.URL.Path, c) {
 			return
 		}
 
@@ -1252,9 +1252,22 @@ func strconvItoa(v int) string {
 
 // shouldSkipOpsErrorLog determines if an error should be skipped from logging based on settings.
 // Returns true for errors that should be filtered according to OpsAdvancedSettings.
-func shouldSkipOpsErrorLog(ctx context.Context, ops *service.OpsService, message, body, requestPath string) bool {
+func shouldSkipOpsErrorLog(ctx context.Context, ops *service.OpsService, message, body, requestPath string, c *gin.Context) bool {
 	if ops == nil {
 		return false
+	}
+
+	msgLower := strings.ToLower(message)
+	bodyLower := strings.ToLower(body)
+
+	// Kiro 分组硬约束：对 kiro 平台/分组的请求，"no available accounts"
+	// 错误不记录到 ops error log。这和账号层面的"永远不挂 temp-unsched"
+	// 策略是成对的——账号既然永远不被标脏，偶发的调度落空也没有排查
+	// 价值，只会刷爆日志。
+	if strings.Contains(msgLower, opsErrNoAvailableAccounts) || strings.Contains(bodyLower, opsErrNoAvailableAccounts) {
+		if isKiroRouteContext(c) {
+			return true
+		}
 	}
 
 	// Get advanced settings to check filter configuration
@@ -1263,9 +1276,6 @@ func shouldSkipOpsErrorLog(ctx context.Context, ops *service.OpsService, message
 		// If we can't get settings, don't skip (fail open)
 		return false
 	}
-
-	msgLower := strings.ToLower(message)
-	bodyLower := strings.ToLower(body)
 
 	// Check if count_tokens errors should be ignored
 	if settings.IgnoreCountTokensErrors && strings.Contains(requestPath, "/count_tokens") {
@@ -1302,5 +1312,21 @@ func shouldSkipOpsErrorLog(ctx context.Context, ops *service.OpsService, message
 		}
 	}
 
+	return false
+}
+
+// isKiroRouteContext 判断当前请求是否属于 Kiro 平台/分组。
+// 优先用 API Key 绑定的分组平台，缺失时回退到按路径和 ctx model 推断。
+func isKiroRouteContext(c *gin.Context) bool {
+	if c == nil {
+		return false
+	}
+	if apiKey, ok := middleware2.GetAPIKeyFromContext(c); ok && apiKey != nil {
+		if apiKey.Group != nil && strings.EqualFold(apiKey.Group.Platform, service.PlatformKiro) {
+			return true
+		}
+	}
+	// Kiro 请求都会走 /v1/messages 或 /v1/chat/completions；分组拿不到的
+	// 时候无法从路径判断，不误伤——只在能确认是 Kiro 分组时跳过。
 	return false
 }

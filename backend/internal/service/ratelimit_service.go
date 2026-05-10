@@ -28,8 +28,13 @@ type RateLimitService struct {
 	openAI403CounterCache OpenAI403CounterCache
 	settingService        *SettingService
 	tokenCacheInvalidator TokenCacheInvalidator
-	usageCacheMu          sync.RWMutex
-	usageCache            map[int64]*geminiUsageCacheEntry
+	// kiroAccountProbe 让限流服务在把 Kiro 账号打成 temp-unschedulable
+	// 之前先跑一次活性探测。Kiro 上游经常会返回偶发的 5xx / 流超时，
+	// 但账号本身还是可用的——直接 park 会造成用户看到的
+	// "No available accounts"。探测失败才真的 park。
+	kiroAccountProbe KiroAccountProbe
+	usageCacheMu     sync.RWMutex
+	usageCache       map[int64]*geminiUsageCacheEntry
 }
 
 // SuccessfulTestRecoveryResult 表示测试成功后恢复了哪些运行时状态。
@@ -96,6 +101,30 @@ func (s *RateLimitService) SetSettingService(settingService *SettingService) {
 // SetTokenCacheInvalidator 设置 token 缓存清理器（可选依赖）
 func (s *RateLimitService) SetTokenCacheInvalidator(invalidator TokenCacheInvalidator) {
 	s.tokenCacheInvalidator = invalidator
+}
+
+// SetKiroAccountProbe 注入 Kiro 账号活性探测实现。注入后，当请求路径
+// 即将把 Kiro 账号打成 temp-unschedulable 前会先 probe 一下；
+// 如果账号实际上还能响应，则跳过本次 park。
+func (s *RateLimitService) SetKiroAccountProbe(probe KiroAccountProbe) {
+	s.kiroAccountProbe = probe
+}
+
+// shouldSkipKiroTempUnsched 判断 Kiro 账号的这次 park 请求是否该被
+// 跳过。当前策略：**Kiro 账号永远不挂 temp-unschedulable**——不管哪种
+// 报错，直接让请求自然失败或切到下一个账号，绝不把账号本身标脏。
+// 这是用户明确要求的硬约束："不管啥报错都正常调度"。
+//
+// 非 Kiro 平台走原有逻辑，不受影响。
+func (s *RateLimitService) shouldSkipKiroTempUnsched(ctx context.Context, account *Account, reason string) bool {
+	if account == nil || account.Platform != PlatformKiro {
+		return false
+	}
+	slog.Info("ratelimit.kiro_park_suppressed",
+		"account_id", account.ID,
+		"reason", reason,
+	)
+	return true
 }
 
 // ErrorPolicyResult 表示错误策略检查的结果
@@ -229,6 +258,13 @@ func (s *RateLimitService) HandleUpstreamError(ctx context.Context, account *Acc
 				cooldownMinutes = 10
 			}
 			until := time.Now().Add(time.Duration(cooldownMinutes) * time.Minute)
+			// Kiro 账号硬约束：永远不挂 temp-unschedulable；401 只触发
+			// 缓存失效 + 强制下次刷新 token，然后让请求正常失败/切账号。
+			if account.Platform == PlatformKiro {
+				slog.Info("oauth_401_kiro_park_suppressed", "account_id", account.ID, "upstream_msg", upstreamMsg)
+				shouldDisable = false
+				break
+			}
 			if err := s.accountRepo.SetTempUnschedulable(ctx, account.ID, until, msg); err != nil {
 				slog.Warn("oauth_401_set_temp_unschedulable_failed", "account_id", account.ID, "error", err)
 			}
@@ -667,6 +703,16 @@ func (s *RateLimitService) GeminiCooldown(ctx context.Context, account *Account)
 
 // handleAuthError 处理认证类错误(401/403)，停止账号调度
 func (s *RateLimitService) handleAuthError(ctx context.Context, account *Account, errorMsg string) {
+	// Kiro 账号硬约束：不写 error 状态，不挂 temp-unschedulable，
+	// 让账号继续在调度池里。认证错误会在每次请求时重复出现，但
+	// 用户明确要求"不管啥报错都正常调度"。
+	if account != nil && account.Platform == PlatformKiro {
+		slog.Info("account_auth_error_kiro_suppressed",
+			"account_id", account.ID,
+			"error", errorMsg,
+		)
+		return
+	}
 	if err := s.accountRepo.SetError(ctx, account.ID, errorMsg); err != nil {
 		slog.Warn("account_set_error_failed", "account_id", account.ID, "error", err)
 		return
@@ -1613,6 +1659,11 @@ func (s *RateLimitService) triggerTempUnschedulable(ctx context.Context, account
 		return false
 	}
 
+	// Kiro 账号：先 probe，若账号仍可用则跳过本次 park。
+	if s.shouldSkipKiroTempUnsched(ctx, account, fmt.Sprintf("rule %d status=%d keyword=%q", ruleIndex, statusCode, matchedKeyword)) {
+		return false
+	}
+
 	now := time.Now()
 	until := now.Add(time.Duration(rule.DurationMinutes) * time.Minute)
 
@@ -1717,6 +1768,17 @@ func (s *RateLimitService) HandleStreamTimeout(ctx context.Context, account *Acc
 
 // triggerStreamTimeoutTempUnsched 触发流超时临时不可调度
 func (s *RateLimitService) triggerStreamTimeoutTempUnsched(ctx context.Context, account *Account, settings *StreamTimeoutSettings, model string) bool {
+	// Kiro 账号：先 probe，若账号仍可用则跳过本次 park。
+	if s.shouldSkipKiroTempUnsched(ctx, account, "stream timeout: "+model) {
+		// 重置超时计数，避免下一次还是瞬间触发。
+		if s.timeoutCounterCache != nil {
+			if err := s.timeoutCounterCache.ResetTimeoutCount(ctx, account.ID); err != nil {
+				slog.Debug("stream_timeout_reset_count_failed_kiro_skip", "account_id", account.ID, "error", err)
+			}
+		}
+		return false
+	}
+
 	now := time.Now()
 	until := now.Add(time.Duration(settings.TempUnschedMinutes) * time.Minute)
 

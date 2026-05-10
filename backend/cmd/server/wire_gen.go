@@ -315,12 +315,29 @@ func initializeApplication(buildInfo handler.BuildInfo) (*Application, error) {
 	// loop: only park a Kiro account as temp-unschedulable after retry
 	// exhaustion IF a probe also fails.
 	tokenRefreshService.SetKiroAccountProbe(kiroGatewayService)
+	// (Kiro revive is handled by a dedicated KiroHealthCheckService now,
+	// not by the token-refresh sweep — see below.)
+	// Rate-limit service: same probe-before-park guard on the hot path.
+	// Kiro upstream errors that match temp-unsched rules (stream
+	// timeout, custom keyword rules) will no longer immediately sideline
+	// the account if it still responds to a probe — the only cause of
+	// Kiro accounts flipping to "temporarily unschedulable" is a failed
+	// probe, which mirrors the behaviour of manual testing.
+	rateLimitService.SetKiroAccountProbe(kiroGatewayService)
+	// Dedicated Kiro health-check loop: every 30s probes each Kiro OAuth
+	// account and, on success, runs the same clear-state chain as the
+	// front-end "batch reset status" button (ClearError +
+	// ClearRateLimit + ClearTempUnschedulable + ClearModelRateLimits +
+	// ClearAntigravityQuotaScopes). Decoupled from token refresh so it
+	// runs on its own cadence regardless of token expiry.
+	kiroHealthCheckService := service.NewKiroHealthCheckService(accountRepository, kiroGatewayService, rateLimitService, schedulerCache, tempUnschedCache)
+	kiroHealthCheckService.Start()
 	accountExpiryService := service.ProvideAccountExpiryService(accountRepository)
 	subscriptionExpiryService := service.ProvideSubscriptionExpiryService(userSubscriptionRepository)
 	scheduledTestRunnerService := service.ProvideScheduledTestRunnerService(scheduledTestPlanRepository, scheduledTestService, accountTestService, rateLimitService, configConfig)
 	paymentOrderExpiryService := service.ProvidePaymentOrderExpiryService(paymentService)
 	channelMonitorRunner := service.ProvideChannelMonitorRunner(channelMonitorService, settingService)
-	v := provideCleanup(client, redisClient, opsMetricsCollector, opsAggregationService, opsAlertEvaluatorService, opsCleanupService, opsScheduledReportService, opsSystemLogSink, schedulerSnapshotService, tokenRefreshService, accountExpiryService, subscriptionExpiryService, usageCleanupService, idempotencyCleanupService, pricingService, emailQueueService, billingCacheService, usageRecordWorkerPool, subscriptionService, oAuthService, openAIOAuthService, geminiOAuthService, antigravityOAuthService, kiroOAuthService, openAIGatewayService, scheduledTestRunnerService, backupService, paymentOrderExpiryService, channelMonitorRunner)
+	v := provideCleanup(client, redisClient, opsMetricsCollector, opsAggregationService, opsAlertEvaluatorService, opsCleanupService, opsScheduledReportService, opsSystemLogSink, schedulerSnapshotService, tokenRefreshService, accountExpiryService, subscriptionExpiryService, usageCleanupService, idempotencyCleanupService, pricingService, emailQueueService, billingCacheService, usageRecordWorkerPool, subscriptionService, oAuthService, openAIOAuthService, geminiOAuthService, antigravityOAuthService, kiroOAuthService, openAIGatewayService, scheduledTestRunnerService, backupService, paymentOrderExpiryService, channelMonitorRunner, kiroHealthCheckService)
 	application := &Application{
 		Server:  httpServer,
 		Cleanup: v,
@@ -376,6 +393,7 @@ func provideCleanup(
 	backupSvc *service.BackupService,
 	paymentOrderExpiry *service.PaymentOrderExpiryService,
 	channelMonitorRunner *service.ChannelMonitorRunner,
+	kiroHealthCheck *service.KiroHealthCheckService,
 ) func() {
 	return func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -443,6 +461,12 @@ func provideCleanup(
 			}},
 			{"TokenRefreshService", func() error {
 				tokenRefresh.Stop()
+				return nil
+			}},
+			{"KiroHealthCheckService", func() error {
+				if kiroHealthCheck != nil {
+					kiroHealthCheck.Stop()
+				}
 				return nil
 			}},
 			{"AccountExpiryService", func() error {

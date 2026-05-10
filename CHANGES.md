@@ -309,3 +309,18 @@ To give users a working "💭 Thinking" UI without OAuth:
 Coverage: encoder tests for both the native and blockquote paths, plus
 a regression test against the real Kiro chunking pattern captured from
 live traffic (`<th`, `inking>\nThe`, …).
+
+
+## Kiro Account Resilience (tie auto-refresh to connectivity test + state reset)
+
+**Problem**: every transient upstream error (stream timeout, 5xx, custom temp-unsched rule match) used to flip a Kiro account to `temp_unschedulable`, and the account stayed parked until the window expired. Users kept seeing `503 No available accounts` even though a manual "test connection" click on the same account succeeded instantly.
+
+**Fix**:
+- `TokenRefreshService.processRefresh`: every background sweep now probes each Kiro account (`ProbeAccount` → minimal `generateAssistantResponse` "hi"). On probe success it clears `error` / `rate_limit_reset_at` / `overload_until` / `temp_unschedulable_until` and syncs the Redis temp-unsched cache + scheduler snapshot. No manual "reset state" click required anymore.
+- `RateLimitService.triggerTempUnschedulable` and `triggerStreamTimeoutTempUnsched`: before parking a Kiro account, run a live probe. Probe OK → skip the park entirely (the account clearly still works). Probe fail → proceed with the original park behaviour.
+- Wiring: `rateLimitService.SetKiroAccountProbe(kiroGatewayService)` and `tokenRefreshService.SetKiroRecovery(rateLimitService)`.
+
+**Files**:
+- `backend/internal/service/token_refresh_service.go` — `tryReviveKiroAccount` helper, `SetKiroRecovery` wiring, call site in `processRefresh`.
+- `backend/internal/service/ratelimit_service.go` — `shouldSkipKiroTempUnsched` helper, guards on both temp-unsched paths.
+- `backend/cmd/server/wire_gen.go` — wire both hooks after the services are constructed.

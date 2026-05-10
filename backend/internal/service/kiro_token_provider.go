@@ -188,61 +188,27 @@ func (p *KiroTokenProvider) ProfileArn(account *Account) string {
 	return strings.TrimSpace(account.GetCredential("profile_arn"))
 }
 
-// markTempUnschedulable parks the account when hot-path refresh fails so the
-// scheduler skips it until the background service recovers.
+// markTempUnschedulable 在这个 fork 里是 no-op。
 //
-// Before actually parking, we run a live probe (if configured): lots of
-// refresh errors are transient (network blip, AWS 5xx bursts, context
-// deadline under load) and the account is still perfectly usable. If
-// the probe succeeds, we log and skip the park entirely — the scheduler
-// keeps the account in the pool and the next request just works.
+// 硬约束：Kiro 账号永远不挂 temp-unschedulable。不管请求路径上的
+// 刷新错误是什么（AWS 5xx、network blip、context deadline、invalid_grant
+// 等），都不再把账号打脏；让请求自然失败或切到下一个账号。
+//
+// 保留函数签名以兼容既有调用点（`GetAccessToken` 出错路径），只记一条
+// 日志便于排查，其他所有副作用（DB 写、Redis 缓存写）都跳过。
 func (p *KiroTokenProvider) markTempUnschedulable(account *Account, refreshErr error) {
-	if p.accountRepo == nil || account == nil {
+	if account == nil {
 		return
 	}
-	if p.accountProbe != nil {
-		probeCtx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
-		defer cancel()
-		if err := p.accountProbe.ProbeAccount(probeCtx, account); err == nil {
-			slog.Info("kiro_token_provider.probe_ok_skip_temp_unsched",
-				"account_id", account.ID,
-				"refresh_error", refreshErr.Error(),
-			)
-			return
-		} else {
-			slog.Warn("kiro_token_provider.probe_failed_proceed_temp_unsched",
-				"account_id", account.ID,
-				"refresh_error", refreshErr.Error(),
-				"probe_error", err.Error(),
-			)
-		}
-	}
-	now := time.Now()
-	until := now.Add(tokenRefreshTempUnschedDuration)
-	reason := "kiro token refresh failed on request path: " + refreshErr.Error()
-	bgCtx := context.Background()
-	if err := p.accountRepo.SetTempUnschedulable(bgCtx, account.ID, until, reason); err != nil {
-		slog.Warn("kiro_token_provider.set_temp_unschedulable_failed",
-			"account_id", account.ID,
-			"error", err,
-		)
-		return
-	}
-	slog.Warn("kiro_token_provider.temp_unschedulable_set",
+	slog.Info("kiro_token_provider.park_suppressed",
 		"account_id", account.ID,
-		"until", until.Format(time.RFC3339),
-		"reason", reason,
+		"refresh_error", func() string {
+			if refreshErr == nil {
+				return ""
+			}
+			return refreshErr.Error()
+		}(),
 	)
-	if p.tempUnschedCache != nil {
-		state := &TempUnschedState{
-			UntilUnix:       until.Unix(),
-			TriggeredAtUnix: now.Unix(),
-			ErrorMessage:    reason,
-		}
-		if err := p.tempUnschedCache.SetTempUnsched(bgCtx, account.ID, state); err != nil {
-			slog.Debug("kiro_token_provider.temp_unsched_cache_set_failed", "account_id", account.ID, "error", err)
-		}
-	}
 }
 
 // KiroTokenCacheKey builds the Redis cache key for the account token.

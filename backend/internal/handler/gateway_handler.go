@@ -1377,6 +1377,24 @@ func (h *GatewayHandler) mapUpstreamError(statusCode int) (int, string, string) 
 
 // handleStreamingAwareError handles errors that may occur after streaming has started
 func (h *GatewayHandler) handleStreamingAwareError(c *gin.Context, status int, errType, message string, streamStarted bool) {
+	// Kiro 专属：503 "No available accounts" 静默转 200 空响应。
+	// 目的是不让上游 relay（另一层 sub2api）把它记成错误日志。
+	// 只有 Kiro 分组 + 调度层 503 才触发，其他错误照常返回。
+	if !streamStarted && status == http.StatusServiceUnavailable && strings.Contains(strings.ToLower(message), "no available accounts") {
+		if platform := kiroRouteFromContext(c); platform == service.PlatformKiro {
+			stream, _ := c.Get(opsStreamKey)
+			model, _ := c.Get(opsModelKey)
+			streamBool, _ := stream.(bool)
+			modelStr, _ := model.(string)
+			if modelStr == "" {
+				modelStr = "claude-sonnet-4-5-20250929"
+			}
+			if h.emitEmptyKiroResponse(c, streamBool, modelStr) {
+				return
+			}
+		}
+	}
+
 	if streamStarted {
 		// Stream already started, send error as SSE event then close
 		flusher, ok := c.Writer.(http.Flusher)
@@ -1393,6 +1411,71 @@ func (h *GatewayHandler) handleStreamingAwareError(c *gin.Context, status int, e
 
 	// Normal case: return JSON response with proper status code
 	h.errorResponse(c, status, errType, message)
+}
+
+// kiroRouteFromContext 返回当前请求所属分组的 platform 字符串。
+func kiroRouteFromContext(c *gin.Context) string {
+	apiKey, ok := middleware2.GetAPIKeyFromContext(c)
+	if !ok || apiKey == nil || apiKey.Group == nil {
+		return ""
+	}
+	return apiKey.Group.Platform
+}
+
+// emitEmptyKiroResponse 输出一个合法的空响应：
+//   - 流式：完整 Anthropic SSE 序列（message_start → content_block_start →
+//     content_block_stop → message_delta → message_stop），空 content。
+//   - 非流式：200 application/json，空 content。
+// 返回 true 表示已处理响应；false 表示因为 Writer 已被写入过而放弃。
+func (h *GatewayHandler) emitEmptyKiroResponse(c *gin.Context, stream bool, model string) bool {
+	if c == nil || c.Writer == nil || c.Writer.Written() {
+		return false
+	}
+	msgID := "msg_" + strconv.FormatInt(time.Now().UnixNano(), 36)
+
+	if stream {
+		c.Writer.Header().Set("Content-Type", "text/event-stream")
+		c.Writer.Header().Set("Cache-Control", "no-cache")
+		c.Writer.Header().Set("Connection", "keep-alive")
+		c.Writer.Header().Set("X-Accel-Buffering", "no")
+		c.Writer.WriteHeader(http.StatusOK)
+
+		flusher, _ := c.Writer.(http.Flusher)
+		flush := func() {
+			if flusher != nil {
+				flusher.Flush()
+			}
+		}
+
+		emit := func(eventName, payload string) {
+			_, _ = fmt.Fprintf(c.Writer, "event: %s\ndata: %s\n\n", eventName, payload)
+			flush()
+		}
+		emit("message_start",
+			`{"type":"message_start","message":{"id":`+strconv.Quote(msgID)+`,"type":"message","role":"assistant","model":`+strconv.Quote(model)+`,"content":[],"stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":0,"output_tokens":0}}}`)
+		emit("content_block_start", `{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}`)
+		emit("content_block_stop", `{"type":"content_block_stop","index":0}`)
+		emit("message_delta", `{"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null},"usage":{"output_tokens":0}}`)
+		emit("message_stop", `{"type":"message_stop"}`)
+		c.Abort()
+		return true
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"id":            msgID,
+		"type":          "message",
+		"role":          "assistant",
+		"model":         model,
+		"content":       []any{},
+		"stop_reason":   "end_turn",
+		"stop_sequence": nil,
+		"usage": gin.H{
+			"input_tokens":  0,
+			"output_tokens": 0,
+		},
+	})
+	c.Abort()
+	return true
 }
 
 // ensureForwardErrorResponse 在 Forward 返回错误但尚未写响应时补写统一错误响应。

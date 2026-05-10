@@ -15,6 +15,12 @@ import (
 	"syscall"
 	"time"
 
+	// Embed the IANA time zone database so that time.LoadLocation works on
+	// Windows hosts that ship without zoneinfo. The config layer reads the
+	// zone name from config.yaml (default "Asia/Shanghai"); without this
+	// import the Windows exe errors out with "unknown time zone" at start.
+	_ "time/tzdata"
+
 	_ "github.com/Wei-Shaw/sub2api/ent/runtime"
 	"github.com/Wei-Shaw/sub2api/internal/config"
 	"github.com/Wei-Shaw/sub2api/internal/handler"

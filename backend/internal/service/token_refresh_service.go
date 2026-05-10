@@ -37,11 +37,23 @@ type TokenRefreshService struct {
 	// refresh failures are transient (AWS 5xx, network blip) and the
 	// account is still perfectly usable. When the probe succeeds after
 	// refresh retries are exhausted, we skip the park.
+	//
+	// Note: With the new hard rule "Kiro accounts never get parked",
+	// this probe is largely moot for Kiro, but kept for completeness
+	// and for the dedicated KiroHealthCheckService to reuse.
 	kiroAccountProbe KiroAccountProbe
 
 	stopCh   chan struct{}
 	stopOnce sync.Once
 	wg       sync.WaitGroup
+}
+
+// AccountStateRecoverer mirrors the subset of RateLimitService needed to
+// revive an account after a successful probe. Declared as an interface so
+// the refresh service stays testable without dragging in the whole
+// rate-limit dependency tree. Shared with KiroHealthCheckService.
+type AccountStateRecoverer interface {
+	RecoverAccountState(ctx context.Context, accountID int64, options AccountRecoveryOptions) (*SuccessfulTestRecoveryResult, error)
 }
 
 // SetKiroAccountProbe wires a live-probe implementation for Kiro accounts.
@@ -301,6 +313,17 @@ func (s *TokenRefreshService) refreshWithRetry(ctx context.Context, account *Acc
 		// 不可重试错误（invalid_grant/invalid_client 等）直接标记 error 状态并返回
 		if isNonRetryableRefreshError(err) {
 			errorMsg := fmt.Sprintf("Token refresh failed (non-retryable): %v", err)
+			// Kiro 账号硬约束：不写 error 状态，让账号继续在调度池里；
+			// 用户已明确要求"不管啥报错都正常调度"。
+			if account.Platform == PlatformKiro {
+				slog.Info("token_refresh.kiro_non_retryable_error_suppressed",
+					"account_id", account.ID,
+					"error", err,
+				)
+				s.ensureOpenAIPrivacy(ctx, account)
+				s.ensureAntigravityPrivacy(ctx, account)
+				return err
+			}
 			if setErr := s.accountRepo.SetError(ctx, account.ID, errorMsg); setErr != nil {
 				slog.Error("token_refresh.set_error_status_failed",
 					"account_id", account.ID,
@@ -341,26 +364,15 @@ func (s *TokenRefreshService) refreshWithRetry(ctx context.Context, account *Acc
 	s.ensureOpenAIPrivacy(ctx, account)
 	s.ensureAntigravityPrivacy(ctx, account)
 
-	// For Kiro accounts, run a live probe before parking. Refresh
-	// failures are frequently transient (AWS 5xx, network blip); if the
-	// account actually still answers, skip temp-unsched so the user
-	// does not see "no available accounts" while manual tests work.
-	if account.Platform == PlatformKiro && s.kiroAccountProbe != nil {
-		probeCtx, probeCancel := context.WithTimeout(ctx, 20*time.Second)
-		defer probeCancel()
-		if probeErr := s.kiroAccountProbe.ProbeAccount(probeCtx, account); probeErr == nil {
-			slog.Info("token_refresh.kiro_probe_ok_skip_temp_unsched",
-				"account_id", account.ID,
-				"refresh_error", lastErr,
-			)
-			return lastErr
-		} else {
-			slog.Warn("token_refresh.kiro_probe_failed_proceed_temp_unsched",
-				"account_id", account.ID,
-				"refresh_error", lastErr,
-				"probe_error", probeErr,
-			)
-		}
+	// Kiro 账号硬约束：永远不挂 temp-unschedulable。即使后台刷新
+	// 重试耗尽，也不在这里 park 账号——让下一轮刷新循环继续尝试，
+	// 或者由用户自己处理（手动重刷/重授权）。
+	if account.Platform == PlatformKiro {
+		slog.Info("token_refresh.kiro_park_suppressed_after_exhaust",
+			"account_id", account.ID,
+			"refresh_error", lastErr,
+		)
+		return lastErr
 	}
 
 	// 设置临时不可调度 10 分钟（不标记 error，保持 status=active 让下个刷新周期能继续尝试）
