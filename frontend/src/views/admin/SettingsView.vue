@@ -3499,6 +3499,8 @@
                         :options="[
                           { value: 'brave', label: 'Brave Search' },
                           { value: 'tavily', label: 'Tavily' },
+                          { value: 'exa', label: 'Exa.ai' },
+                          { value: 'serper', label: 'Serper (Google)' },
                         ]"
                         class="w-36"
                         @click.stop

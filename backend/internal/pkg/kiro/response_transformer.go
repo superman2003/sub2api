@@ -21,10 +21,10 @@ type AssistantEventPayload struct {
 }
 
 // ToolUseEventPayload is emitted when the model decides to call a tool.
-// Input 字段在 Kiro 上游可能是：
-//   - string（partial JSON 片段，多帧追加后拼成完整 JSON 对象）
+// Input 字段�?Kiro 上游可能是：
+//   - string（partial JSON 片段，多帧追加后拼成完整 JSON 对象�?
 //   - object（完整的参数对象，一帧到位）
-// 参考 kiro-gateway 开源实现：两种形式都要支持。
+// 参�?kiro-gateway 开源实现：两种形式都要支持�?
 type ToolUseEventPayload struct {
 	ToolUseID string `json:"toolUseId,omitempty"`
 	Name      string `json:"name,omitempty"`
@@ -32,12 +32,12 @@ type ToolUseEventPayload struct {
 	Stop      bool   `json:"stop,omitempty"`
 }
 
-// toolInputAsPartialJSON 把 toolUseEvent.input 统一转成客户端期望的
-// partial_json 片段形式（纯 JSON 文本，不带外层引号）。
+// toolInputAsPartialJSON �?toolUseEvent.input 统一转成客户端期望的
+// partial_json 片段形式（纯 JSON 文本，不带外层引号）�?
 //
-//   - 空值 → 返回 ""
-//   - string（已是 partial JSON，例如 `{"query": "hi`）→ 原样返回
-//   - object / array / number / bool → json.Marshal 后返回
+//   - 空�?�?返回 ""
+//   - string（已�?partial JSON，例�?`{"query": "hi`）→ 原样返回
+//   - object / array / number / bool �?json.Marshal 后返�?
 func toolInputAsPartialJSON(v any) string {
 	if v == nil {
 		return ""
@@ -159,8 +159,8 @@ func ParseEventStreamFrame(msg *EventStreamMessage) (*StreamEvent, error) {
 		return nil, nil
 
 	case "messageMetadataEvent", "followupPromptEvent", "codeReferenceEvent", "supplementaryWebLinksEvent":
-		// messageMetadataEvent 在部分 Kiro 响应里携带 input/output token 计数，
-		// 尝试按 usage 负载解析；失败或没有字段时直接忽略该帧。
+		// messageMetadataEvent 在部�?Kiro 响应里携�?input/output token 计数�?
+		// 尝试�?usage 负载解析；失败或没有字段时直接忽略该帧�?
 		if msg.EventType() == "messageMetadataEvent" && len(msg.Payload) > 0 {
 			var p UsageEventPayload
 			if err := json.Unmarshal(msg.Payload, &p); err == nil {
@@ -211,7 +211,7 @@ type AnthropicSSEEncoder struct {
 	messageID     string
 	textBlockOpen bool
 	// thinkingBlockOpen tracks whether a thinking content_block is
-	// currently active. Mutually exclusive with textBlockOpen — switching
+	// currently active. Mutually exclusive with textBlockOpen �?switching
 	// between thinking and text closes the other block first.
 	thinkingBlockOpen bool
 	// thinkingBuf accumulates the raw text of the current thinking block
@@ -219,16 +219,38 @@ type AnthropicSSEEncoder struct {
 	// signature_delta. Claude Code's UI silently hides thinking blocks
 	// that arrive without a signature, so we derive one deterministically
 	// from the thinking text itself.
-	thinkingBuf       strings.Builder
-	blockIndex        int
-	toolBlocks        map[string]int // toolUseID -> block index
-	inputTokens       int64
-	outputTokens      int64
-	// Kiro-specific aggregates captured during the stream.
+	thinkingBuf strings.Builder
+	blockIndex  int
+	toolBlocks  map[string]int // toolUseID -> block index
+	// pendingTools buffers tool_use lifecycle until tool_use_stop arrives
+	// (or the stream ends). Kiro's upstream frequently sends object-style
+	// input in every frame (not partial JSON strings), so we cannot just
+	// forward each frame to the client �?we would end up with
+	// `{...}{...}{...}` which Claude Code rejects. Instead we aggregate
+	// the canonical final input per tool and emit a single
+	// start/delta/stop triple when the tool finishes.
+	pendingTools map[string]*pendingToolBlock
+	// toolOrder preserves tool_use_start order so Finish() can close
+	// them in the same sequence they were opened.
+	toolOrder       []string
+	inputTokens     int64
+	outputTokens    int64
 	meteringCredit  float64
 	meteringUnit    string
 	contextUsagePct float64
 	started         bool
+}
+
+// pendingToolBlock holds the aggregated state for a single tool_use
+// lifecycle before its block is flushed to the wire.
+type pendingToolBlock struct {
+	toolName string
+	// input accumulates partial_json fragments (string-style input) or
+	// records the latest complete JSON (object-style input). finalInput
+	// supersedes it when a full object was seen.
+	input       strings.Builder
+	finalInput  string
+	inputSeen   bool
 }
 
 // NewAnthropicSSEEncoder builds an encoder. The flusher is called after each
@@ -239,11 +261,12 @@ type AnthropicSSEEncoder struct {
 // for the message_delta at the end of the stream.
 func NewAnthropicSSEEncoder(w io.Writer, flush func(), model string) *AnthropicSSEEncoder {
 	return &AnthropicSSEEncoder{
-		w:          w,
-		flush:      flush,
-		model:      model,
-		messageID:  "msg_" + strings.ReplaceAll(uuid.NewString(), "-", "")[:24],
-		toolBlocks: make(map[string]int),
+		w:            w,
+		flush:        flush,
+		model:        model,
+		messageID:    "msg_" + strings.ReplaceAll(uuid.NewString(), "-", "")[:24],
+		toolBlocks:   make(map[string]int),
+		pendingTools: make(map[string]*pendingToolBlock),
 	}
 }
 
@@ -310,6 +333,9 @@ func (e *AnthropicSSEEncoder) Emit(ev *StreamEvent) error {
 				return err
 			}
 		}
+		if err := e.closeOpenToolBlocks(); err != nil {
+			return err
+		}
 		if !e.textBlockOpen {
 			e.textBlockOpen = true
 			if err := e.write("content_block_start", map[string]any{
@@ -341,6 +367,9 @@ func (e *AnthropicSSEEncoder) Emit(ev *StreamEvent) error {
 			if err := e.closeCurrentNonToolBlock(); err != nil {
 				return err
 			}
+		}
+		if err := e.closeOpenToolBlocks(); err != nil {
+			return err
 		}
 		if !e.thinkingBlockOpen {
 			e.thinkingBlockOpen = true
@@ -375,67 +404,35 @@ func (e *AnthropicSSEEncoder) Emit(ev *StreamEvent) error {
 		return nil
 
 	case "tool_use_start":
-		// Close any open text or thinking block before starting a tool block.
-		if e.textBlockOpen || e.thinkingBlockOpen {
-			if err := e.closeCurrentNonToolBlock(); err != nil {
-				return err
-			}
+		// Buffer the tool lifecycle until tool_use_stop arrives. Kiro
+		// sends the canonical input in every frame (object form), and
+		// only a single complete block can be forwarded to the client �?
+		// see flushPendingTool() for the actual emission.
+		if _, ok := e.pendingTools[ev.ToolUseID]; !ok {
+			e.pendingTools[ev.ToolUseID] = &pendingToolBlock{toolName: ev.ToolName}
+			e.toolOrder = append(e.toolOrder, ev.ToolUseID)
+		} else if ev.ToolName != "" {
+			// Repeated start with a name �?usually the same tool, but
+			// refresh the name just in case Kiro promoted a placeholder.
+			e.pendingTools[ev.ToolUseID].toolName = ev.ToolName
 		}
-		idx := e.blockIndex
-		e.toolBlocks[ev.ToolUseID] = idx
-		block := map[string]any{
-			"type":  "tool_use",
-			"id":    normalizeToolUseID(ev.ToolUseID),
-			"name":  ev.ToolName,
-			"input": map[string]any{},
-		}
-		if err := e.write("content_block_start", map[string]any{
-			"type":          "content_block_start",
-			"index":         idx,
-			"content_block": block,
-		}); err != nil {
-			return err
-		}
-		if len(ev.ToolInput) > 0 {
-			if err := e.write("content_block_delta", map[string]any{
-				"type":  "content_block_delta",
-				"index": idx,
-				"delta": map[string]any{
-					"type":         "input_json_delta",
-					"partial_json": ev.ToolInput,
-				},
-			}); err != nil {
-				return err
-			}
+		if ev.ToolInput != "" {
+			e.recordToolInput(ev.ToolUseID, ev.ToolInput)
 		}
 		return nil
 
 	case "tool_use_delta":
-		idx, ok := e.toolBlocks[ev.ToolUseID]
-		if !ok {
-			idx = e.blockIndex
+		if _, ok := e.pendingTools[ev.ToolUseID]; !ok {
+			e.pendingTools[ev.ToolUseID] = &pendingToolBlock{}
+			e.toolOrder = append(e.toolOrder, ev.ToolUseID)
 		}
-		return e.write("content_block_delta", map[string]any{
-			"type":  "content_block_delta",
-			"index": idx,
-			"delta": map[string]any{
-				"type":         "input_json_delta",
-				"partial_json": ev.ToolDelta,
-			},
-		})
+		if ev.ToolDelta != "" {
+			e.recordToolInput(ev.ToolUseID, ev.ToolDelta)
+		}
+		return nil
 
 	case "tool_use_stop":
-		idx, ok := e.toolBlocks[ev.ToolUseID]
-		if !ok {
-			idx = e.blockIndex
-		}
-		delete(e.toolBlocks, ev.ToolUseID)
-		err := e.write("content_block_stop", map[string]any{
-			"type":  "content_block_stop",
-			"index": idx,
-		})
-		e.blockIndex++
-		return err
+		return e.flushPendingTool(ev.ToolUseID)
 
 	case "usage":
 		if ev.Usage.InputTokens > 0 {
@@ -526,10 +523,170 @@ func syntheticThinkingSignature(thinking string) string {
 	return "sub2api-kiro-emulated:" + hex.EncodeToString(sum[:16])
 }
 
+// closeOpenToolBlocks flushes every pending tool_use that has not yet
+// received a stop frame. This is called before opening a new text /
+// thinking / tool block to avoid index collisions �?Kiro's wire format
+// skips the explicit tool_use_stop frame in some situations and without
+// this flush the next block would inherit the stale index, causing
+// Claude Code to raise "Content block is not a input_json block".
+func (e *AnthropicSSEEncoder) closeOpenToolBlocks() error {
+	if len(e.pendingTools) == 0 && len(e.toolBlocks) == 0 {
+		return nil
+	}
+	// Flush pending tools (buffered start/delta/stop triple).
+	for _, id := range e.toolOrder {
+		if _, ok := e.pendingTools[id]; ok {
+			if err := e.flushPendingTool(id); err != nil {
+				return err
+			}
+		}
+	}
+	// Any legacy tool blocks that somehow entered toolBlocks without a
+	// pending buffer (shouldn't happen with the new pipeline, but defend
+	// in depth): close them by emitting stop.
+	for id, idx := range e.toolBlocks {
+		if err := e.write("content_block_stop", map[string]any{
+			"type":  "content_block_stop",
+			"index": idx,
+		}); err != nil {
+			return err
+		}
+		delete(e.toolBlocks, id)
+		e.blockIndex++
+	}
+	return nil
+}
+
+// recordToolInput keeps track of the latest tool input seen for a tool.
+// Kiro sends input either as a complete JSON object (every frame carrying
+// the same bytes) or as a streamed partial_json string (frames carry
+// disjoint fragments). We detect the two modes:
+//   - frame content identical to a previously seen frame �?drop (dup)
+//   - frame that already looks like a complete JSON object �?overwrite
+//     finalInput (object-style mode)
+//   - otherwise append to the string buffer (partial-string mode)
+func (e *AnthropicSSEEncoder) recordToolInput(id, fragment string) {
+	p, ok := e.pendingTools[id]
+	if !ok {
+		p = &pendingToolBlock{}
+		e.pendingTools[id] = p
+		e.toolOrder = append(e.toolOrder, id)
+	}
+	trimmed := strings.TrimSpace(fragment)
+	if trimmed == "" {
+		return
+	}
+	// Object-style mode: fragment is a complete JSON object/array.
+	if looksLikeCompleteJSON(trimmed) {
+		p.finalInput = trimmed
+		p.inputSeen = true
+		return
+	}
+	// Partial-string mode: append to the buffer.
+	if !p.inputSeen {
+		p.inputSeen = true
+	}
+	p.input.WriteString(fragment)
+}
+
+// looksLikeCompleteJSON returns true if s is a syntactically complete
+// JSON object or array. Used to distinguish between object-style input
+// (complete every frame) and streamed partial_json (incremental).
+func looksLikeCompleteJSON(s string) bool {
+	if len(s) < 2 {
+		return false
+	}
+	first, last := s[0], s[len(s)-1]
+	if !((first == '{' && last == '}') || (first == '[' && last == ']')) {
+		return false
+	}
+	return json.Valid([]byte(s))
+}
+
+// flushPendingTool emits the buffered tool_use as a single
+// content_block_start �?content_block_delta �?content_block_stop triple
+// and advances the block index. No-op when no buffer exists for the id.
+func (e *AnthropicSSEEncoder) flushPendingTool(id string) error {
+	p, ok := e.pendingTools[id]
+	if !ok {
+		return nil
+	}
+	// Close any other block type first.
+	if e.textBlockOpen || e.thinkingBlockOpen {
+		if err := e.closeCurrentNonToolBlock(); err != nil {
+			return err
+		}
+	}
+
+	// Resolve the final input string. Object-style wins; otherwise use
+	// the accumulated partial_json. Parse to verify it's a JSON object;
+	// Claude Code requires `input` to be an object, not a raw string.
+	inputStr := p.finalInput
+	if inputStr == "" {
+		inputStr = p.input.String()
+	}
+	inputObj := map[string]any{}
+	if trimmed := strings.TrimSpace(inputStr); trimmed != "" {
+		_ = json.Unmarshal([]byte(trimmed), &inputObj)
+	}
+
+	idx := e.blockIndex
+	if err := e.write("content_block_start", map[string]any{
+		"type":  "content_block_start",
+		"index": idx,
+		"content_block": map[string]any{
+			"type":  "tool_use",
+			"id":    normalizeToolUseID(id),
+			"name":  p.toolName,
+			"input": map[string]any{},
+		},
+	}); err != nil {
+		return err
+	}
+	// Emit the final input as a single partial_json delta so the
+	// client assembles it in one shot. We marshal the parsed object so
+	// the output is canonical JSON (no duplicate keys, consistent
+	// escaping).
+	canonical, err := json.Marshal(inputObj)
+	if err != nil {
+		return err
+	}
+	if err := e.write("content_block_delta", map[string]any{
+		"type":  "content_block_delta",
+		"index": idx,
+		"delta": map[string]any{
+			"type":         "input_json_delta",
+			"partial_json": string(canonical),
+		},
+	}); err != nil {
+		return err
+	}
+	if err := e.write("content_block_stop", map[string]any{
+		"type":  "content_block_stop",
+		"index": idx,
+	}); err != nil {
+		return err
+	}
+	delete(e.pendingTools, id)
+	// Drop the id from toolOrder without allocating a new slice.
+	for i, oid := range e.toolOrder {
+		if oid == id {
+			e.toolOrder = append(e.toolOrder[:i], e.toolOrder[i+1:]...)
+			break
+		}
+	}
+	e.blockIndex++
+	return nil
+}
+
 // Finish closes any open blocks and emits message_delta/message_stop.
 func (e *AnthropicSSEEncoder) Finish(stopReason string) error {
 	if err := e.Start(); err != nil {
 		return err
+	}
+	// Flush any tool_use buffers that never received an explicit stop.
+	for _, id := range append([]string{}, e.toolOrder...) {
+		_ = e.flushPendingTool(id)
 	}
 	if e.textBlockOpen || e.thinkingBlockOpen {
 		_ = e.closeCurrentNonToolBlock()
@@ -583,10 +740,10 @@ func (e *AnthropicSSEEncoder) ContextUsagePct() float64 { return e.contextUsageP
 func (e *AnthropicSSEEncoder) MessageID() string { return e.messageID }
 
 // ToolCallInterceptor lets callers intercept a complete tool_use lifecycle
-// (start → deltas → stop) and either let it pass through to the client or
+// (start �?deltas �?stop) and either let it pass through to the client or
 // replace it with an arbitrary synthetic event stream. Typical use: fulfil
 // Kiro's web_search tool_use server-side via /mcp so the client never sees
-// the tool call — it sees the search result as regular assistant text.
+// the tool call �?it sees the search result as regular assistant text.
 //
 // The interceptor is consulted exactly once per tool_use lifecycle. When
 // OnToolStart returns handled=true, the gateway buffers the whole
@@ -628,12 +785,7 @@ func DriveEventStreamToAnthropicWithInterceptor(
 	// Per-intercepted-tool buffer: tool_use_start + its deltas are held
 	// here until tool_use_stop is observed, at which point the interceptor
 	// decides what to emit.
-	type pendingTool struct {
-		name   string
-		input  strings.Builder
-		active bool
-	}
-	pending := make(map[string]*pendingTool)
+	pending := make(map[string]*interceptorPending)
 
 	// Kiro's wire format emits every toolUseEvent frame with the same
 	// `name` field populated, even though only the first one is a real
@@ -643,15 +795,30 @@ func DriveEventStreamToAnthropicWithInterceptor(
 	// started so we can demote later frames from tool_use_start to
 	// tool_use_delta before downstream logic runs.
 	seenStarts := make(map[string]struct{})
+	// lastToolInput remembers the last input fragment we forwarded for a
+	// given toolUseId. When Kiro's upstream emits `input` as a complete
+	// JSON object rather than a streamed-string partial, every frame
+	// carries the *same* full JSON and the naive "demote to delta" logic
+	// would concatenate the same JSON object multiple times �?Claude
+	// Code then rejects the tool_use with "Content block is not a
+	// input_json block" because `{...}{...}` is not valid JSON. We keep
+	// the last forwarded fragment so duplicates are dropped.
+	lastToolInput := make(map[string]string)
 
-	// thinkSplitter converts raw assistant text — which may include
+	// thinkSplitter converts raw assistant text �?which may include
 	// <thinking>...</thinking> blocks when we injected the
-	// thinking_mode=enabled prompt — into a mix of content and thinking
+	// thinking_mode=enabled prompt �?into a mix of content and thinking
 	// events. Stateful across chunks to handle tags split at arbitrary
 	// boundaries. The byte cap defensively protects against models that
 	// ignore the prompt-level budget and would otherwise eat the whole
 	// output token ceiling on reasoning alone.
 	thinkSplitter := &ThinkingSplitter{MaxThinkingBytes: defaultThinkingByteCap}
+	// bracketSplitter rescues tool_use invocations that the Kiro model
+	// sometimes renders as literal text (e.g. "[tool_use Bash {...}]")
+	// instead of proper toolUseEvent frames. When detected, the splitter
+	// swaps the text for synthetic tool_use_start/stop events so Claude
+	// Code actually executes the call instead of showing raw JSON.
+	bracketSplitter := NewBracketToolSplitter()
 
 	emit := func(ev *StreamEvent) error {
 		if ev.Kind == "content" {
@@ -661,13 +828,21 @@ func DriveEventStreamToAnthropicWithInterceptor(
 	}
 
 	// emitParsed runs a (possibly content) event through the thinking
-	// splitter and forwards whatever it produces. Non-content events pass
+	// splitter, then the bracket splitter. Non-content events pass
 	// straight through.
 	emitParsed := func(ev *StreamEvent) error {
 		if ev.Kind != "content" {
 			return emit(ev)
 		}
 		for _, out := range thinkSplitter.Feed(ev.Text) {
+			if out.Kind == "content" {
+				for _, sub := range bracketSplitter.Feed(out.Text) {
+					if err := emit(sub); err != nil {
+						return err
+					}
+				}
+				continue
+			}
 			if err := emit(out); err != nil {
 				return err
 			}
@@ -685,6 +860,19 @@ func DriveEventStreamToAnthropicWithInterceptor(
 				// Flush any trailing bytes still held by the thinking
 				// splitter so unterminated chunks reach the client.
 				for _, out := range thinkSplitter.Flush() {
+					if out.Kind == "content" {
+						for _, sub := range bracketSplitter.Feed(out.Text) {
+							if eerr := emit(sub); eerr != nil {
+								return textBuf.String(), eerr
+							}
+						}
+						continue
+					}
+					if eerr := emit(out); eerr != nil {
+						return textBuf.String(), eerr
+					}
+				}
+				for _, out := range bracketSplitter.Flush() {
 					if eerr := emit(out); eerr != nil {
 						return textBuf.String(), eerr
 					}
@@ -699,7 +887,7 @@ func DriveEventStreamToAnthropicWithInterceptor(
 							continue
 						}
 						delete(pending, id)
-						if ierr := interceptor.OnToolStop(ctx, id, p.name, p.input.String(), emit); ierr != nil {
+						if ierr := interceptor.OnToolStop(ctx, id, p.name, finalToolInput(p), emit); ierr != nil {
 							_ = emit(&StreamEvent{
 								Kind:         "error",
 								ErrorType:    "tool_interceptor_error",
@@ -720,23 +908,39 @@ func DriveEventStreamToAnthropicWithInterceptor(
 			continue
 		}
 
-		// Normalise Kiro's repeated tool_use_start frames: keep the first
-		// one (real start), convert the rest into tool_use_delta carrying
-		// the same input fragment, so downstream code handles them as
-		// continuations.
+		// Kiro's wire format emits every toolUseEvent frame with the same
+		// `name` field populated, even though only the first one is a real
+		// "start" and subsequent ones carry the full input again.
+		// For the interceptor pipeline we still need to distinguish the
+		// real start (invokes OnToolStart) from follow-up frames (feed
+		// input buffer). Demote repeats into tool_use_delta for that
+		// purpose. The encoder itself does not care because it
+		// aggregates both kinds into the same pendingToolBlock.
 		if ev.Kind == "tool_use_start" {
 			if _, already := seenStarts[ev.ToolUseID]; already {
+				if ev.ToolInput == lastToolInput[ev.ToolUseID] {
+					// Exact duplicate �?still forward one delta so the
+					// encoder's pendingToolBlock.finalInput gets set
+					// (object-style input only appears in a dup frame
+					// after the initial start). Skipping would leave
+					// finalInput empty when the first start carried no
+					// ToolInput string.
+				}
 				ev = &StreamEvent{
 					Kind:      "tool_use_delta",
 					ToolUseID: ev.ToolUseID,
 					ToolDelta: ev.ToolInput,
 				}
+				lastToolInput[ev.ToolUseID] = ev.ToolDelta
 			} else {
 				seenStarts[ev.ToolUseID] = struct{}{}
+				lastToolInput[ev.ToolUseID] = ev.ToolInput
 			}
+		} else if ev.Kind == "tool_use_delta" {
+			lastToolInput[ev.ToolUseID] = ev.ToolDelta
 		} else if ev.Kind == "tool_use_stop" {
-			// Once the tool finishes we no longer need to remember it.
 			delete(seenStarts, ev.ToolUseID)
+			delete(lastToolInput, ev.ToolUseID)
 		}
 
 		// Interceptor hook: buffer tool_use events of interest until stop.
@@ -744,22 +948,22 @@ func DriveEventStreamToAnthropicWithInterceptor(
 			switch ev.Kind {
 			case "tool_use_start":
 				if interceptor.OnToolStart(ctx, ev) {
-					p := &pendingTool{name: ev.ToolName, active: true}
+					p := &interceptorPending{name: ev.ToolName, active: true}
 					if ev.ToolInput != "" {
-						p.input.WriteString(ev.ToolInput)
+						addToolInputFragment(p, ev.ToolInput)
 					}
 					pending[ev.ToolUseID] = p
 					continue
 				}
 			case "tool_use_delta":
 				if p, ok := pending[ev.ToolUseID]; ok && p.active {
-					p.input.WriteString(ev.ToolDelta)
+					addToolInputFragment(p, ev.ToolDelta)
 					continue
 				}
 			case "tool_use_stop":
 				if p, ok := pending[ev.ToolUseID]; ok && p.active {
 					delete(pending, ev.ToolUseID)
-					if ierr := interceptor.OnToolStop(ctx, ev.ToolUseID, p.name, p.input.String(), emit); ierr != nil {
+					if ierr := interceptor.OnToolStop(ctx, ev.ToolUseID, p.name, finalToolInput(p), emit); ierr != nil {
 						if eerr := emit(&StreamEvent{
 							Kind:         "error",
 							ErrorType:    "tool_interceptor_error",
@@ -798,4 +1002,572 @@ func normalizeToolUseID(id string) string {
 		return id // already correct
 	}
 	return "toolu_" + id
+}
+
+
+// FollowUpEmitter is the callback shape used by DriveFollowUp to hand
+// parsed events back to the caller. The caller is responsible for
+// forwarding those events to the client encoder (or dropping/rewriting
+// them), which is why DriveFollowUp does not take an encoder directly �?
+// a follow-up turn shares the envelope of the primary turn.
+type FollowUpEmitter interface {
+	Emit(ev *StreamEvent) error
+}
+
+// DriveFollowUp reads a Kiro /generateAssistantResponse SSE stream the
+// same way DriveEventStreamToAnthropic does �?crucially applying the
+// "repeated tool_use_start is really a delta" Kiro wire-format rule �?and
+// hands each normalised event to the caller-supplied emitter. It does
+// NOT own an encoder, which lets a follow-up turn reuse the primary
+// turn's encoder state (message_start / blockIndex / etc.) via the
+// caller's emit closure.
+//
+// Returns the accumulated content text (for logging/diagnostics) and any
+// error other than io.EOF.
+func DriveFollowUp(ctx context.Context, r io.Reader, sink FollowUpEmitter) (string, error) {
+	if sink == nil {
+		return "", fmt.Errorf("kiro: DriveFollowUp requires a non-nil sink")
+	}
+	reader := NewEventStreamReader(r)
+	var textBuf bytes.Buffer
+
+	seenStarts := make(map[string]struct{})
+	lastToolInput := make(map[string]string)
+	// bracketSplitter rescues bracket-style tool_use invocations that
+	// Kiro occasionally renders as plain text even inside follow-up
+	// turns (WebFetch, Bash curl commands, etc). Mirrors the main
+	// driver's pipeline.
+	bracketSplitter := NewBracketToolSplitter()
+
+	emitWithBracket := func(ev *StreamEvent) error {
+		if ev.Kind != "content" {
+			return sink.Emit(ev)
+		}
+		textBuf.WriteString(ev.Text)
+		for _, sub := range bracketSplitter.Feed(ev.Text) {
+			if err := sink.Emit(sub); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+
+	for {
+		if ctx.Err() != nil {
+			return textBuf.String(), ctx.Err()
+		}
+		msg, err := reader.Next()
+		if err != nil {
+			if errors.Is(err, io.EOF) {
+				for _, sub := range bracketSplitter.Flush() {
+					if eerr := sink.Emit(sub); eerr != nil {
+						return textBuf.String(), eerr
+					}
+				}
+				return textBuf.String(), nil
+			}
+			return textBuf.String(), err
+		}
+		ev, perr := ParseEventStreamFrame(msg)
+		if perr != nil {
+			return textBuf.String(), perr
+		}
+		if ev == nil {
+			continue
+		}
+
+		// Same normalisation rule as the main driver: the first
+		// tool_use frame is the real start, every subsequent frame
+		// with the same toolUseId is actually a partial-input delta.
+		// When input is sent as a complete JSON object, every frame
+		// repeats the same payload - drop duplicates to avoid
+		// concatenating the same JSON multiple times.
+		if ev.Kind == "tool_use_start" {
+			if _, already := seenStarts[ev.ToolUseID]; already {
+				if ev.ToolInput == lastToolInput[ev.ToolUseID] {
+					continue
+				}
+				ev = &StreamEvent{
+					Kind:      "tool_use_delta",
+					ToolUseID: ev.ToolUseID,
+					ToolDelta: ev.ToolInput,
+				}
+				lastToolInput[ev.ToolUseID] = ev.ToolDelta
+			} else {
+				seenStarts[ev.ToolUseID] = struct{}{}
+				lastToolInput[ev.ToolUseID] = ev.ToolInput
+			}
+		} else if ev.Kind == "tool_use_delta" {
+			if ev.ToolDelta == lastToolInput[ev.ToolUseID] {
+				continue
+			}
+			lastToolInput[ev.ToolUseID] = ev.ToolDelta
+		} else if ev.Kind == "tool_use_stop" {
+			delete(seenStarts, ev.ToolUseID)
+			delete(lastToolInput, ev.ToolUseID)
+		}
+
+		if eerr := emitWithBracket(ev); eerr != nil {
+			return textBuf.String(), eerr
+		}
+	}
+}
+
+
+// AnthropicNonStreamBuilder accumulates StreamEvents and produces a single
+// Anthropic /v1/messages JSON response body at the end. Used when the
+// client issued a non-streaming request (`stream: false`) �?Kiro's
+// upstream always returns an SSE stream, so we buffer it and collapse it
+// to the classic JSON shape before replying.
+//
+// The builder mirrors AnthropicSSEEncoder's lifecycle (Start �?Emit(*) �?
+// Finish) so the same driver function can drive either implementation.
+// It is deliberately minimal: we only surface the fields Claude Code
+// actually consumes (content blocks, stop_reason, usage) and skip
+// metering/context-usage because those never leave the gateway layer.
+type AnthropicNonStreamBuilder struct {
+	model     string
+	messageID string
+
+	// Open-block tracking: mirrors the encoder so tool_use ID lifetimes
+	// line up. We key by Kiro's native id and map to the index into
+	// blocks[] so deltas can find the right partial_json buffer.
+	blocks    []nonStreamBlock
+	toolByID  map[string]int
+	textIdx   int // index into blocks of the current open text block, or -1
+	thinkIdx  int // index into blocks of the current open thinking block, or -1
+
+	inputTokens    int64
+	outputTokens   int64
+	meteringCredit float64
+	meteringUnit   string
+	contextUsage   float64
+	stopReason     string
+	finished       bool
+}
+
+// nonStreamBlock is a single content block accumulated during assembly.
+type nonStreamBlock struct {
+	kind       string // "text" | "thinking" | "tool_use"
+	text       string
+	thinking   string
+	toolID     string // Kiro-native id; normalised at Finish()
+	toolName   string
+	toolInput  strings.Builder // partial_json accumulated across deltas
+	finalInput string          // complete JSON object, when provided whole per frame
+}
+
+// NewAnthropicNonStreamBuilder constructs a fresh builder. The model name
+// is echoed back in the final JSON response (same as what the SSE encoder
+// emits in message_start).
+func NewAnthropicNonStreamBuilder(model string) *AnthropicNonStreamBuilder {
+	return &AnthropicNonStreamBuilder{
+		model:     model,
+		messageID: "msg_" + uuid.NewString(),
+		toolByID:  make(map[string]int),
+		textIdx:   -1,
+		thinkIdx:  -1,
+	}
+}
+
+// SetInputTokensHint pre-populates the input_tokens field so relay
+// consumers can read it even if the upstream never reports usage. Mirrors
+// AnthropicSSEEncoder.SetInputTokensHint.
+func (b *AnthropicNonStreamBuilder) SetInputTokensHint(n int64) {
+	if n > 0 && b.inputTokens == 0 {
+		b.inputTokens = n
+	}
+}
+
+// Start is a no-op for the builder; retained so the interface matches
+// AnthropicSSEEncoder and the driver code can call it unconditionally.
+func (b *AnthropicNonStreamBuilder) Start() error { return nil }
+
+// Emit consumes a single StreamEvent. The builder silently ignores error
+// and done events �?stop_reason is derived from Finish()'s argument.
+func (b *AnthropicNonStreamBuilder) Emit(ev *StreamEvent) error {
+	if ev == nil {
+		return nil
+	}
+	switch ev.Kind {
+	case "content":
+		if ev.Text == "" {
+			return nil
+		}
+		b.closeOpenTools()
+		if b.thinkIdx >= 0 {
+			b.thinkIdx = -1
+		}
+		if b.textIdx < 0 {
+			b.blocks = append(b.blocks, nonStreamBlock{kind: "text"})
+			b.textIdx = len(b.blocks) - 1
+		}
+		b.blocks[b.textIdx].text += ev.Text
+		b.outputTokens += int64(len(ev.Text) / 4)
+
+	case "thinking":
+		if ev.Text == "" {
+			return nil
+		}
+		b.closeOpenTools()
+		if b.textIdx >= 0 {
+			b.textIdx = -1
+		}
+		if b.thinkIdx < 0 {
+			b.blocks = append(b.blocks, nonStreamBlock{kind: "thinking"})
+			b.thinkIdx = len(b.blocks) - 1
+		}
+		b.blocks[b.thinkIdx].thinking += ev.Text
+		b.outputTokens += int64(len(ev.Text) / 4)
+
+	case "tool_use_start":
+		b.closeOpenTools()
+		b.textIdx = -1
+		b.thinkIdx = -1
+		b.blocks = append(b.blocks, nonStreamBlock{
+			kind:     "tool_use",
+			toolID:   ev.ToolUseID,
+			toolName: ev.ToolName,
+		})
+		idx := len(b.blocks) - 1
+		b.toolByID[ev.ToolUseID] = idx
+		if ev.ToolInput != "" {
+			b.recordToolInput(idx, ev.ToolInput)
+		}
+
+	case "tool_use_delta":
+		if idx, ok := b.toolByID[ev.ToolUseID]; ok {
+			b.recordToolInput(idx, ev.ToolDelta)
+		}
+
+	case "tool_use_stop":
+		delete(b.toolByID, ev.ToolUseID)
+
+	case "usage":
+		if ev.Usage.InputTokens > 0 {
+			b.inputTokens = ev.Usage.InputTokens
+		}
+		if ev.Usage.OutputTokens > 0 {
+			b.outputTokens = ev.Usage.OutputTokens
+		}
+
+	case "metering":
+		if ev.Metering.Usage > 0 {
+			b.meteringCredit += ev.Metering.Usage
+		}
+		if ev.Metering.Unit != "" {
+			b.meteringUnit = ev.Metering.Unit
+		}
+
+	case "context_usage":
+		if ev.ContextUsagePct > b.contextUsage {
+			b.contextUsage = ev.ContextUsagePct
+		}
+	}
+	return nil
+}
+
+// closeOpenTools clears all open tool lifecycle trackers without emitting
+// anything �?the builder just moves on to a new block.
+func (b *AnthropicNonStreamBuilder) closeOpenTools() {
+	if len(b.toolByID) == 0 {
+		return
+	}
+	for id := range b.toolByID {
+		delete(b.toolByID, id)
+	}
+}
+
+// Finish seals the response with the given stop reason and returns the
+// assembled Anthropic Messages JSON payload.
+func (b *AnthropicNonStreamBuilder) Finish(stopReason string) ([]byte, error) {
+	if stopReason == "" {
+		stopReason = "end_turn"
+	}
+	b.stopReason = stopReason
+	b.finished = true
+
+	content := make([]map[string]any, 0, len(b.blocks))
+	for _, blk := range b.blocks {
+		switch blk.kind {
+		case "text":
+			content = append(content, map[string]any{
+				"type": "text",
+				"text": blk.text,
+			})
+		case "thinking":
+			content = append(content, map[string]any{
+				"type":      "thinking",
+				"thinking":  blk.thinking,
+				"signature": syntheticThinkingSignature(blk.thinking),
+			})
+		case "tool_use":
+			// Parse accumulated partial_json into a concrete input object
+			// so the Anthropic response carries an object (not a string).
+			raw := blk.finalInput
+			if raw == "" {
+				raw = blk.toolInput.String()
+			}
+			inputObj := parseToolUseInput(raw)
+			content = append(content, map[string]any{
+				"type":  "tool_use",
+				"id":    normalizeToolUseID(blk.toolID),
+				"name":  blk.toolName,
+				"input": inputObj,
+			})
+		}
+	}
+
+	msg := map[string]any{
+		"id":            b.messageID,
+		"type":          "message",
+		"role":          "assistant",
+		"model":         b.model,
+		"content":       content,
+		"stop_reason":   stopReason,
+		"stop_sequence": nil,
+		"usage": map[string]any{
+			"input_tokens":  b.inputTokens,
+			"output_tokens": b.outputTokens,
+		},
+	}
+	return json.Marshal(msg)
+}
+
+// parseToolUseInput tries to interpret the accumulated partial_json as a
+// full JSON object. On failure it returns an empty object. Downstream
+// Claude Code will treat that as a malformed tool call.
+func parseToolUseInput(raw string) map[string]any {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return map[string]any{}
+	}
+	var obj map[string]any
+	if err := json.Unmarshal([]byte(raw), &obj); err != nil {
+		return map[string]any{}
+	}
+	return obj
+}
+
+// recordToolInput merges a single frame's input payload into the
+// addressed tool block. Complete JSON object frames overwrite the final
+// input (Kiro's object-style delivery); partial JSON fragments are
+// appended (string-style delivery). Mirrors
+// AnthropicSSEEncoder.recordToolInput.
+func (b *AnthropicNonStreamBuilder) recordToolInput(idx int, fragment string) {
+	if idx < 0 || idx >= len(b.blocks) {
+		return
+	}
+	trimmed := strings.TrimSpace(fragment)
+	if trimmed == "" {
+		return
+	}
+	if looksLikeCompleteJSON(trimmed) {
+		b.blocks[idx].finalInput = trimmed
+		return
+	}
+	b.blocks[idx].toolInput.WriteString(fragment)
+}
+
+// MessageID returns the stable message id used in the assembled response.
+func (b *AnthropicNonStreamBuilder) MessageID() string { return b.messageID }
+
+// InputTokens/OutputTokens/MeteringCredit/ContextUsagePct expose
+// accumulated counters so the service layer can record usage the same
+// way it does for the streaming encoder.
+func (b *AnthropicNonStreamBuilder) InputTokens() int64      { return b.inputTokens }
+func (b *AnthropicNonStreamBuilder) OutputTokens() int64     { return b.outputTokens }
+func (b *AnthropicNonStreamBuilder) MeteringCredit() float64 { return b.meteringCredit }
+func (b *AnthropicNonStreamBuilder) MeteringUnit() string    { return b.meteringUnit }
+func (b *AnthropicNonStreamBuilder) ContextUsagePct() float64 {
+	return b.contextUsage
+}
+
+// AnthropicEventSink is the common interface implemented by both the
+// streaming encoder (AnthropicSSEEncoder) and the non-streaming builder
+// (AnthropicNonStreamBuilder). The driver functions use it so callers can
+// pick the right output mode at the call site.
+type AnthropicEventSink interface {
+	Start() error
+	Emit(ev *StreamEvent) error
+}
+
+// DriveEventStreamToSink is a sink-generic version of
+// DriveEventStreamToAnthropicWithInterceptor. Used by non-streaming paths
+// that feed events into AnthropicNonStreamBuilder.
+func DriveEventStreamToSink(
+	ctx context.Context,
+	r io.Reader,
+	sink AnthropicEventSink,
+	interceptor ToolCallInterceptor,
+) (string, error) {
+	// Reuse the SSE driver by wrapping the sink into an encoder-like
+	// shim. The only method that matters is Emit; Start is idempotent.
+	if enc, ok := sink.(*AnthropicSSEEncoder); ok {
+		return DriveEventStreamToAnthropicWithInterceptor(ctx, r, enc, interceptor)
+	}
+	// For non-SSE sinks, run a miniature driver that only forwards
+	// events. We still apply the Kiro repeat-start delta
+	// normalisation so tool_use accumulation is correct.
+	reader := NewEventStreamReader(r)
+	var textBuf bytes.Buffer
+	seenStarts := make(map[string]struct{})
+	lastToolInput := make(map[string]string)
+	pending := make(map[string]*interceptorPending)
+	bracketSplitter := NewBracketToolSplitter()
+
+	emit := func(ev *StreamEvent) error {
+		if ev.Kind != "content" {
+			return sink.Emit(ev)
+		}
+		textBuf.WriteString(ev.Text)
+		for _, sub := range bracketSplitter.Feed(ev.Text) {
+			if err := sink.Emit(sub); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+
+	for {
+		if ctx.Err() != nil {
+			return textBuf.String(), ctx.Err()
+		}
+		msg, err := reader.Next()
+		if err != nil {
+			if errors.Is(err, io.EOF) {
+				// Finalise any unterminated intercepted tool calls.
+				if interceptor != nil {
+					for id, p := range pending {
+						if !p.active {
+							continue
+						}
+						delete(pending, id)
+						if ierr := interceptor.OnToolStop(ctx, id, p.name, finalToolInput(p), emit); ierr != nil {
+							_ = emit(&StreamEvent{
+								Kind:         "error",
+								ErrorType:    "tool_interceptor_error",
+								ErrorMessage: ierr.Error(),
+							})
+						}
+					}
+				}
+				// Flush any remaining bracket-form tool call still
+				// buffered by the splitter.
+				for _, sub := range bracketSplitter.Flush() {
+					if eerr := sink.Emit(sub); eerr != nil {
+						return textBuf.String(), eerr
+					}
+				}
+				return textBuf.String(), nil
+			}
+			return textBuf.String(), err
+		}
+		ev, perr := ParseEventStreamFrame(msg)
+		if perr != nil {
+			return textBuf.String(), perr
+		}
+		if ev == nil {
+			continue
+		}
+		if ev.Kind == "tool_use_start" {
+			if _, already := seenStarts[ev.ToolUseID]; already {
+				if ev.ToolInput == lastToolInput[ev.ToolUseID] {
+					continue
+				}
+				ev = &StreamEvent{
+					Kind:      "tool_use_delta",
+					ToolUseID: ev.ToolUseID,
+					ToolDelta: ev.ToolInput,
+				}
+				lastToolInput[ev.ToolUseID] = ev.ToolDelta
+			} else {
+				seenStarts[ev.ToolUseID] = struct{}{}
+				lastToolInput[ev.ToolUseID] = ev.ToolInput
+			}
+		} else if ev.Kind == "tool_use_delta" {
+			if ev.ToolDelta == lastToolInput[ev.ToolUseID] {
+				continue
+			}
+			lastToolInput[ev.ToolUseID] = ev.ToolDelta
+		} else if ev.Kind == "tool_use_stop" {
+			delete(seenStarts, ev.ToolUseID)
+			delete(lastToolInput, ev.ToolUseID)
+		}
+		if interceptor != nil {
+			switch ev.Kind {
+			case "tool_use_start":
+				if interceptor.OnToolStart(ctx, ev) {
+					p := &interceptorPending{name: ev.ToolName, active: true}
+					if ev.ToolInput != "" {
+						addToolInputFragment(p, ev.ToolInput)
+					}
+					pending[ev.ToolUseID] = p
+					continue
+				}
+			case "tool_use_delta":
+				if p, ok := pending[ev.ToolUseID]; ok && p.active {
+					addToolInputFragment(p, ev.ToolDelta)
+					continue
+				}
+			case "tool_use_stop":
+				if p, ok := pending[ev.ToolUseID]; ok && p.active {
+					delete(pending, ev.ToolUseID)
+					if ierr := interceptor.OnToolStop(ctx, ev.ToolUseID, p.name, finalToolInput(p), emit); ierr != nil {
+						if eerr := emit(&StreamEvent{
+							Kind:         "error",
+							ErrorType:    "tool_interceptor_error",
+							ErrorMessage: ierr.Error(),
+						}); eerr != nil {
+							return textBuf.String(), eerr
+						}
+					}
+					continue
+				}
+			}
+		}
+		if err := emit(ev); err != nil {
+			return textBuf.String(), err
+		}
+	}
+}
+
+
+// interceptorPending buffers a tool_use lifecycle while the interceptor
+// decides what to do with it. Kiro's upstream may deliver input either
+// as a complete JSON object repeated every frame, or as a stream of
+// partial_json fragments. addToolInputFragment and finalToolInput handle
+// both modes transparently so the interceptor always sees a single,
+// canonical input string at OnToolStop time.
+type interceptorPending struct {
+	name       string
+	input      strings.Builder
+	finalInput string
+	active     bool
+}
+
+// addToolInputFragment merges a single frame's input payload into a
+// pending tool buffer. It recognises complete-JSON-object frames (which
+// supersede any previously captured input) and falls back to appending
+// streaming fragments.
+func addToolInputFragment(p *interceptorPending, fragment string) {
+	trimmed := strings.TrimSpace(fragment)
+	if trimmed == "" {
+		return
+	}
+	if looksLikeCompleteJSON(trimmed) {
+		p.finalInput = trimmed
+		return
+	}
+	p.input.WriteString(fragment)
+}
+
+// finalToolInput returns the canonical input string for the buffered
+// tool call: the latest complete JSON object if one was seen, otherwise
+// the accumulated partial_json fragments.
+func finalToolInput(p *interceptorPending) string {
+	if p.finalInput != "" {
+		return p.finalInput
+	}
+	return p.input.String()
 }

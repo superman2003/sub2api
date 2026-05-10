@@ -174,3 +174,88 @@ This fork adds **Kiro platform support** (Amazon Q Developer / CodeWhisperer) an
 This project is licensed under LGPL-3.0, same as the upstream project.
 Original work Copyright (C) Wei-Shaw.
 Modifications Copyright (C) 2026 superman2003.
+
+### Web Search Emulation — Additional Providers (Exa + Serper)
+- Added two new search providers alongside the existing Brave and Tavily
+  implementations so operators can pick backends that match their query
+  mix:
+  - **Exa.ai** (`exa`): neural/keyword hybrid that excels at fresh English
+    news (CNN, Reuters, AP…) and returns semantic highlights the upstream
+    model can summarise directly. We request `contents.text` + 3-sentence
+    highlights per URL and surface the most informative snippet; the
+    `publishedDate` ISO timestamp is translated into `page_age` for
+    Anthropic-style consumers.
+  - **Serper** (`serper`): Google Search reverse-proxy via
+    `google.serper.dev`. Much better Chinese coverage than Brave because
+    it inherits Google's own index (People's Daily, cnblogs, sogou, etc.).
+    Uses POST `/search` with `X-API-KEY` auth and maps `organic` results
+    into the provider-agnostic `SearchResult` shape.
+- Registered both under `websearch.ProviderType{Exa,Serper}` and extended
+  `Manager.buildProvider`, the settings-side `validProviderTypes` map, the
+  frontend `WebSearchProviderConfig.type` union, and the provider-picker
+  `<Select>` in Admin → Settings → Web Search Emulation so they can be
+  added through the UI like any other provider.
+- Same load-balancing, quota bookkeeping, proxy awareness, and
+  rollback-on-failure semantics as Brave/Tavily — zero new code paths on
+  the hot path, only a new factory entry.
+
+### Claude Code Tool Coverage Hardening (WebSearch → Bash → WebFetch → *)
+Iterative series of fixes that together make every Claude Code tool call
+survive the round-trip through Kiro, not just `WebSearch`.
+
+- **Object-style tool input aggregation.** Kiro frequently re-sends the
+  full `input` JSON object in every `toolUseEvent` frame (rather than
+  streaming a partial_json string). The encoder used to concatenate each
+  frame as `input_json_delta`, producing `{...}{...}` that Claude Code
+  rejects with `Content block is not a input_json block`. The encoder
+  now buffers the whole tool_use lifecycle into a `pendingToolBlock`,
+  detects complete-JSON-object frames via `looksLikeCompleteJSON`,
+  dedupes, and emits a single canonical
+  `content_block_start → input_json_delta → content_block_stop` triple
+  on `tool_use_stop`. Same fix applied to the non-stream builder.
+- **Implicit block transitions.** If the Kiro stream skips `tool_use_stop`
+  and jumps straight to text, the encoder used to keep the tool block
+  index live and collide with the new text block. Added
+  `closeOpenToolBlocks` that flushes any in-flight tool before opening a
+  text/thinking/new-tool block so the client never sees an index
+  mismatch.
+- **Non-streaming requests.** `stream: false` now goes through
+  `AnthropicNonStreamBuilder` which collapses the Kiro SSE stream into
+  a classic Anthropic `application/json` response (id / content /
+  usage / stop_reason). Previously the gateway always replied with
+  `text/event-stream`, which caused Claude Code's WebFetch follow-up
+  loop to crash with `undefined is not an object (evaluating
+  '$.input_tokens')`.
+- **Follow-up turn handler.** The web_search summary follow-up used to
+  silently drop any tool_use events it saw, which broke WebFetch the
+  moment the model asked for it. The new `followUpStreamHandler` allows
+  nested `web_search` calls up to `maxDepth = 3`, forwards every other
+  tool to the client (WebFetch / Read / Edit / Bash / Task* / Cron*
+  / NotebookEdit / Agent / Skill / mcp_*), and at the depth cap still
+  runs the search but streams the raw summary as plain text so Claude
+  Code does not hang waiting for a tool_result.
+- **Bracket-style tool recovery.** Some Kiro model variants render tool
+  calls as literal assistant text — e.g.
+  `[tool_use Bash {"command":"curl ..."}]` or the older
+  `[Called get_weather with args: {...}]`. The new
+  `BracketToolSplitter` sits in every content pipeline (main SSE driver,
+  non-streaming sink, follow-up driver), detects both shapes with a
+  JSON-aware brace matcher (strings, escapes, nested objects), and
+  rewrites them into synthetic `tool_use_start/stop` events so the
+  downstream encoder produces real tool_use blocks. Partial bracket
+  shapes across chunk boundaries are held in a short tail buffer until
+  the closing `]` arrives. Coverage: all 29 tools observed in a real
+  Claude Code request dump (Bash / Edit / Read / Write / Grep / Glob /
+  WebFetch / WebSearch / Task* / Cron* / NotebookEdit / Agent / Skill /
+  AskUserQuestion / EnterPlanMode / ExitPlanMode / EnterWorktree /
+  ExitWorktree / ScheduleWakeup / RemoteTrigger / mcp__* double-underscore
+  names). Unit tests in `bracket_tool_parser_test.go` pin the contract.
+- **Third-party search providers.** `websearch.Manager` gains two new
+  providers: `Exa.ai` (strong English news coverage, returns highlights
+  + publishedDate) and `Serper` (Google Search reverse-proxy with good
+  Chinese coverage). Wired into the factory, the settings-side
+  validator, and the admin UI's provider picker. The Kiro web_search
+  interceptor now prefers the Manager (Exa / Serper / Brave / Tavily)
+  and only falls back to Kiro's own `/mcp` when every configured
+  provider fails, so admins can pick the backend that matches their
+  query mix.

@@ -20,6 +20,7 @@ func newTestInterceptor(arn string) *kiroWebSearchInterceptor {
 		http.Header{},
 		nil,
 		1,
+		"",
 	)
 }
 

@@ -464,6 +464,10 @@ func (m *Manager) buildProvider(cfg ProviderConfig, client *http.Client) Provide
 		return NewBraveProvider(cfg.APIKey, client)
 	case tavilyProviderName:
 		return NewTavilyProvider(cfg.APIKey, client)
+	case exaProviderName:
+		return NewExaProvider(cfg.APIKey, client)
+	case serperProviderName:
+		return NewSerperProvider(cfg.APIKey, client)
 	default:
 		slog.Warn("websearch: unknown provider type, falling back to brave",
 			"type", cfg.Type)

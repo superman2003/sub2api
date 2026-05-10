@@ -10,8 +10,10 @@ import (
 	"log/slog"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/Wei-Shaw/sub2api/internal/pkg/kiro"
+	"github.com/Wei-Shaw/sub2api/internal/pkg/websearch"
 )
 
 // kiroWebSearchInterceptor implements kiro.ToolCallInterceptor. When the
@@ -40,7 +42,18 @@ type kiroWebSearchInterceptor struct {
 	headers   http.Header
 	cache     *kiroMCPResultCache
 	accountID int64
+	proxyURL  string // Outbound proxy URL for third-party search providers.
+	depth     int    // Current recursion depth (0 for the top-level turn).
+	maxDepth  int    // Maximum allowed recursion depth for nested searches.
 }
+
+// webSearchMaxRecursionDepth caps how many nested web_search calls the
+// Kiro model can trigger inside a single tool-use lifecycle. When the
+// cap is hit we still run the search but skip the follow-up turn that
+// would normally let the model continue — the raw results are streamed
+// as plain text so Claude Code (or whoever is driving) can finish the
+// conversation without hanging on a missing tool_result.
+const webSearchMaxRecursionDepth = 3
 
 // newKiroWebSearchInterceptor constructs an interceptor bound to a single
 // Kiro request. The http.Client should already honour any account-specific
@@ -57,6 +70,7 @@ func newKiroWebSearchInterceptor(
 	headers http.Header,
 	cache *kiroMCPResultCache,
 	accountID int64,
+	proxyURL string,
 ) *kiroWebSearchInterceptor {
 	region := kiro.RegionFromProfileArn(buildOpts.ProfileArn)
 	if region == "" {
@@ -73,6 +87,9 @@ func newKiroWebSearchInterceptor(
 		headers:   headers,
 		cache:     cache,
 		accountID: accountID,
+		proxyURL:  proxyURL,
+		depth:     0,
+		maxDepth:  webSearchMaxRecursionDepth,
 	}
 }
 
@@ -122,30 +139,48 @@ func (i *kiroWebSearchInterceptor) OnToolStop(
 		})
 	}
 
-	slog.Info("kiro web_search interceptor: executing MCP query",
+	slog.Info("kiro web_search interceptor: executing query",
 		"tool_use_id", toolUseID, "query", query, "region", i.region)
 
 	var mcpResp *kiro.MCPWebSearchResponse
+	var providerLabel string
 	if cached := i.cache.Get(ctx, i.accountID, query); cached != nil {
 		slog.Info("kiro web_search interceptor: cache hit",
 			"tool_use_id", toolUseID, "query", query,
 			"results", len(cached.Results))
 		mcpResp = cached
+		providerLabel = "cache"
 	} else {
-		resp, err := kiro.CallMCPWebSearch(ctx, i.client, i.region, i.token, query)
-		if err != nil {
-			slog.Error("kiro web_search interceptor: MCP call failed", "error", err)
-			return emit(&kiro.StreamEvent{
-				Kind: "content",
-				Text: fmt.Sprintf(
-					"\n<web_search>\nWeb search failed: %s\n</web_search>\n",
-					err.Error(),
-				),
-			})
+		// 1) Prefer the configured third-party Provider Manager
+		//    (Exa/Serper/Brave/Tavily) — these are typically faster and
+		//    have much better Chinese coverage than Kiro's own index.
+		if resp, provider, ok := i.tryManagerSearch(ctx, query); ok {
+			mcpResp = resp
+			providerLabel = provider
+			i.cache.Set(ctx, i.accountID, query, mcpResp)
+		} else {
+			// 2) Fallback to Kiro's /mcp endpoint with the account's own
+			//    token (zero-config path).
+			resp, err := kiro.CallMCPWebSearch(ctx, i.client, i.region, i.token, query)
+			if err != nil {
+				slog.Error("kiro web_search interceptor: MCP call failed", "error", err)
+				return emit(&kiro.StreamEvent{
+					Kind: "content",
+					Text: fmt.Sprintf(
+						"\n<web_search>\nWeb search failed: %s\n</web_search>\n",
+						err.Error(),
+					),
+				})
+			}
+			mcpResp = resp
+			providerLabel = "kiro_mcp"
+			i.cache.Set(ctx, i.accountID, query, mcpResp)
 		}
-		mcpResp = resp
-		i.cache.Set(ctx, i.accountID, query, mcpResp)
 	}
+
+	slog.Info("kiro web_search interceptor: results ready",
+		"tool_use_id", toolUseID, "provider", providerLabel,
+		"results", len(mcpResp.Results))
 
 	// The MCP payload is our source of truth for the follow-up turn.
 	// Serialise it as JSON text so the model can quote it naturally.
@@ -259,46 +294,289 @@ func (i *kiroWebSearchInterceptor) requestFollowUpSummary(
 		return false, fmt.Errorf("follow-up status %d: %s", resp.StatusCode, string(raw))
 	}
 
-	// Stream the follow-up response. We use a nil interceptor because we
-	// don't want to recurse into another web_search turn if the model for
-	// some reason decides to call the tool again.
-	wroteAny := false
-	reader := kiro.NewEventStreamReader(resp.Body)
-	for {
-		if ctx.Err() != nil {
-			return wroteAny, ctx.Err()
-		}
-		msg, rerr := reader.Next()
-		if rerr != nil {
-			if errors.Is(rerr, io.EOF) {
-				return wroteAny, nil
+	// Stream the follow-up response through the same driver used for the
+	// primary turn. This is critical: the driver handles Kiro's wire
+	// quirks (e.g. every tool_use frame repeats `name` and would otherwise
+	// open multiple content blocks for one tool) and runs content through
+	// the thinking splitter, so Claude Code renders tool calls from the
+	// second turn (WebFetch, Read, …) as proper tool_use blocks rather
+	// than inline text. We plug in a small handler that recursively
+	// fulfils any further web_search calls up to maxDepth, and transparently
+	// forwards every other tool so Claude Code can execute it.
+	handler := &followUpStreamHandler{
+		interceptor:   i,
+		emit:          emit,
+		parentHistory: followUp.Messages,
+	}
+	if _, err := kiro.DriveFollowUp(ctx, resp.Body, handler); err != nil && !errors.Is(err, context.Canceled) {
+		return handler.wroteAny, err
+	}
+	// After the stream completes, resolve any pending nested web_search
+	// calls the model made. Each one spawns its own MCP lookup +
+	// follow-up turn, whose output is streamed back to the same emit
+	// callback. This keeps the chain going until either the model stops
+	// calling web_search or we hit maxDepth.
+	if err := handler.resolvePending(ctx); err != nil {
+		return handler.wroteAny, err
+	}
+	return handler.wroteAny, nil
+}
+
+// pendingNestedSearch captures the minimum data needed to fulfil a
+// nested web_search tool call once its stop frame arrives.
+type pendingNestedSearch struct {
+	toolUseID  string
+	toolName   string
+	input      strings.Builder
+	atDepthCap bool // true when the nested call would exceed maxDepth
+}
+
+// followUpStreamHandler drives a follow-up Kiro stream, forwarding
+// content/tool events to the caller's emit callback while buffering any
+// nested web_search tool-use lifecycle so it can be resolved after the
+// primary follow-up stream finishes.
+type followUpStreamHandler struct {
+	interceptor   *kiroWebSearchInterceptor
+	emit          func(*kiro.StreamEvent) error
+	parentHistory []kiro.AnthropicMessage
+	wroteAny      bool
+	pending       map[string]*pendingNestedSearch
+}
+
+// Emit is the FollowUpEmitter hook. Recursive web_search calls are kept
+// inside this handler; everything else passes through to the client.
+func (h *followUpStreamHandler) Emit(ev *kiro.StreamEvent) error {
+	if ev == nil {
+		return nil
+	}
+	switch ev.Kind {
+	case "tool_use_start":
+		if isKiroWebSearchToolName(ev.ToolName) {
+			if h.pending == nil {
+				h.pending = make(map[string]*pendingNestedSearch)
 			}
-			return wroteAny, rerr
+			// Flag whether this nested call has room for another
+			// follow-up turn. When it doesn't, we still run the
+			// search — but ship the raw result back as plain text
+			// (see resolvePending) instead of spawning another Kiro
+			// /generateAssistantResponse round so we don't burn
+			// credits in a loop.
+			atCap := h.interceptor.depth+1 >= h.interceptor.maxDepth
+			h.pending[ev.ToolUseID] = &pendingNestedSearch{
+				toolUseID: ev.ToolUseID,
+				toolName:  ev.ToolName,
+				atDepthCap: atCap,
+			}
+			if ev.ToolInput != "" {
+				h.pending[ev.ToolUseID].input.WriteString(ev.ToolInput)
+			}
+			slog.Info("kiro web_search interceptor: buffering nested web_search",
+				"tool_use_id", ev.ToolUseID,
+				"depth", h.interceptor.depth+1,
+				"at_cap", atCap)
+			return nil
 		}
-		ev, perr := kiro.ParseEventStreamFrame(msg)
-		if perr != nil {
-			return wroteAny, perr
+		// Pass-through tool — forward to the client.
+		h.wroteAny = true
+		return h.emit(ev)
+	case "tool_use_delta":
+		if p, ok := h.pending[ev.ToolUseID]; ok {
+			p.input.WriteString(ev.ToolDelta)
+			return nil
 		}
-		if ev == nil {
+		return h.emit(ev)
+	case "tool_use_stop":
+		if _, ok := h.pending[ev.ToolUseID]; ok {
+			// Keep the buffer alive; resolvePending consumes it.
+			return nil
+		}
+		return h.emit(ev)
+	case "content":
+		h.wroteAny = true
+		return h.emit(ev)
+	case "usage", "metering", "context_usage":
+		return h.emit(ev)
+	}
+	// Unknown event kinds: forward as-is to be safe.
+	return h.emit(ev)
+}
+
+// resolvePending runs each buffered nested web_search call, stitches the
+// result into a new Kiro follow-up turn, and streams that turn's output
+// through this same handler recursively.
+func (h *followUpStreamHandler) resolvePending(ctx context.Context) error {
+	if len(h.pending) == 0 {
+		return nil
+	}
+	// Deterministic resolution order based on insertion into the map is
+	// not guaranteed in Go; we don't need strict ordering because each
+	// search uses its own tool_use_id, but resolve them sequentially to
+	// keep log output readable.
+	for id, p := range h.pending {
+		delete(h.pending, id)
+		query := extractQueryFromToolInput(p.input.String())
+		if query == "" {
+			slog.Warn("kiro web_search interceptor: nested call has empty query; skipping",
+				"tool_use_id", id)
 			continue
 		}
-		// Surface only content and usage. tool_use from this second turn
-		// would be unexpected; if it happens we skip to avoid confusing
-		// the downstream encoder.
-		switch ev.Kind {
-		case "content":
-			wroteAny = true
-			if err := emit(ev); err != nil {
-				return wroteAny, err
+
+		// Run the search via the same manager/MCP fallback as the top-level.
+		mcpResp, providerLabel := h.interceptor.runSearch(ctx, query)
+		if mcpResp == nil {
+			h.wroteAny = true
+			if err := h.emit(&kiro.StreamEvent{
+				Kind: "content",
+				Text: "\n<web_search>\n(Nested search failed.)\n</web_search>\n",
+			}); err != nil {
+				return err
 			}
-		case "usage", "metering", "context_usage":
-			// Pass through for accounting so billing/context widgets
-			// work even for search turns.
-			if err := emit(ev); err != nil {
-				return wroteAny, err
+			continue
+		}
+		slog.Info("kiro web_search interceptor: nested search resolved",
+			"tool_use_id", id, "provider", providerLabel,
+			"results", len(mcpResp.Results),
+			"depth", h.interceptor.depth+1,
+			"at_cap", p.atDepthCap)
+
+		// If we're at the recursion cap, skip the follow-up turn and
+		// stream the raw search summary as plain text. Claude Code (or
+		// whichever client is driving) can then wrap up the
+		// conversation without hanging on a missing tool_result.
+		if p.atDepthCap {
+			h.wroteAny = true
+			if err := h.emit(&kiro.StreamEvent{
+				Kind: "content",
+				Text: kiro.FormatSearchSummary(mcpResp),
+			}); err != nil {
+				return err
 			}
+			continue
+		}
+
+		rawResultsJSON, merr := json.Marshal(mcpResp)
+		if merr != nil {
+			h.wroteAny = true
+			if err := h.emit(&kiro.StreamEvent{
+				Kind: "content",
+				Text: kiro.FormatSearchSummary(mcpResp),
+			}); err != nil {
+				return err
+			}
+			continue
+		}
+
+		// Build the history for the nested follow-up: prior history +
+		// our assistant/user tool pair for this nested call.
+		nestedHistory := append([]kiro.AnthropicMessage{}, h.parentHistory...)
+
+		assistantContent := []map[string]any{
+			{
+				"type":  "tool_use",
+				"id":    id,
+				"name":  p.toolName,
+				"input": json.RawMessage(fmt.Sprintf(`{"query":%q}`, query)),
+			},
+		}
+		assistantJSON, err := json.Marshal(assistantContent)
+		if err != nil {
+			return fmt.Errorf("marshal nested assistant content: %w", err)
+		}
+		userContent := []map[string]any{
+			{
+				"type":        "tool_result",
+				"tool_use_id": id,
+				"content":     string(rawResultsJSON),
+			},
+		}
+		userJSON, err := json.Marshal(userContent)
+		if err != nil {
+			return fmt.Errorf("marshal nested tool result: %w", err)
+		}
+		nestedHistory = append(nestedHistory,
+			kiro.AnthropicMessage{Role: "assistant", Content: assistantJSON},
+			kiro.AnthropicMessage{Role: "user", Content: userJSON},
+		)
+
+		// Increment depth for the nested stream.
+		childInterceptor := *h.interceptor
+		childInterceptor.depth = h.interceptor.depth + 1
+
+		nestedReq := *h.interceptor.anthReq
+		nestedReq.Messages = nestedHistory
+		wrote, err := childInterceptor.streamFollowUp(ctx, &nestedReq, h.emit)
+		if wrote {
+			h.wroteAny = true
+		}
+		if err != nil {
+			return err
 		}
 	}
+	return nil
+}
+
+// runSearch is a shared helper that returns an MCP-shaped response for the
+// given query, preferring the third-party Manager and falling back to
+// Kiro's /mcp endpoint.
+func (i *kiroWebSearchInterceptor) runSearch(ctx context.Context, query string) (*kiro.MCPWebSearchResponse, string) {
+	if cached := i.cache.Get(ctx, i.accountID, query); cached != nil {
+		return cached, "cache"
+	}
+	if resp, provider, ok := i.tryManagerSearch(ctx, query); ok {
+		i.cache.Set(ctx, i.accountID, query, resp)
+		return resp, provider
+	}
+	resp, err := kiro.CallMCPWebSearch(ctx, i.client, i.region, i.token, query)
+	if err != nil {
+		slog.Error("kiro web_search interceptor: search failed", "error", err)
+		return nil, ""
+	}
+	i.cache.Set(ctx, i.accountID, query, resp)
+	return resp, "kiro_mcp"
+}
+
+// streamFollowUp issues a Kiro request with the provided history and
+// streams the result through the same follow-up handler (supporting
+// further nested searches). Returns whether any event was emitted.
+func (i *kiroWebSearchInterceptor) streamFollowUp(
+	ctx context.Context,
+	req *kiro.AnthropicRequest,
+	emit func(*kiro.StreamEvent) error,
+) (bool, error) {
+	payload, err := kiro.BuildKiroPayload(req, i.buildOpts)
+	if err != nil {
+		return false, fmt.Errorf("build nested payload: %w", err)
+	}
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return false, fmt.Errorf("marshal nested payload: %w", err)
+	}
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, i.endpoint, bytes.NewReader(body))
+	if err != nil {
+		return false, fmt.Errorf("build nested http request: %w", err)
+	}
+	httpReq.Header = i.headers.Clone()
+	resp, err := i.client.Do(httpReq)
+	if err != nil {
+		return false, fmt.Errorf("nested http do: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 8192))
+		return false, fmt.Errorf("nested status %d: %s", resp.StatusCode, string(raw))
+	}
+	handler := &followUpStreamHandler{
+		interceptor:   i,
+		emit:          emit,
+		parentHistory: req.Messages,
+	}
+	if _, err := kiro.DriveFollowUp(ctx, resp.Body, handler); err != nil && !errors.Is(err, context.Canceled) {
+		return handler.wroteAny, err
+	}
+	if err := handler.resolvePending(ctx); err != nil {
+		return handler.wroteAny, err
+	}
+	return handler.wroteAny, nil
 }
 
 // extractQueryFromToolInput parses the aggregated partial_json string that
@@ -318,4 +596,82 @@ func extractQueryFromToolInput(raw string) string {
 		return strings.TrimSpace(q)
 	}
 	return ""
+}
+
+// tryManagerSearch attempts to fulfil the web_search tool call using the
+// configured third-party search Manager (Brave/Tavily/Exa/Serper) before
+// falling back to Kiro's own /mcp endpoint. Returns ok=false when no
+// Manager is configured or every provider failed — callers should treat
+// that as a signal to try the fallback path.
+//
+// The Manager's SearchResponse is adapted into kiro.MCPWebSearchResponse
+// so the rest of the interceptor pipeline (cache, follow-up summary turn,
+// FormatSearchSummary fallback) stays unchanged.
+func (i *kiroWebSearchInterceptor) tryManagerSearch(
+	ctx context.Context,
+	query string,
+) (*kiro.MCPWebSearchResponse, string, bool) {
+	mgr := getWebSearchManager()
+	if mgr == nil {
+		return nil, "", false
+	}
+	resp, provider, err := mgr.SearchWithBestProvider(ctx, websearch.SearchRequest{
+		Query:      query,
+		MaxResults: webSearchDefaultMaxResults,
+		ProxyURL:   i.proxyURL,
+	})
+	if err != nil {
+		// Proxy unavailability is surfaced so the gateway can switch
+		// accounts; for any other manager-level error we simply fall
+		// through to Kiro's /mcp endpoint.
+		if errors.Is(err, websearch.ErrProxyUnavailable) {
+			slog.Warn("kiro web_search interceptor: manager proxy unavailable; falling back to kiro /mcp",
+				"error", err)
+			return nil, "", false
+		}
+		slog.Warn("kiro web_search interceptor: manager search failed; falling back to kiro /mcp",
+			"error", err)
+		return nil, "", false
+	}
+	return adaptWebSearchToMCP(query, resp), provider, true
+}
+
+// adaptWebSearchToMCP converts a generic search response into Kiro's MCP
+// response shape. The only non-trivial field is publishedDate, which Kiro
+// encodes as Unix milliseconds. We make a best-effort to parse the
+// provider's human-readable timestamp and drop it on parse failure so
+// FormatSearchSummary simply skips the line.
+func adaptWebSearchToMCP(query string, resp *websearch.SearchResponse) *kiro.MCPWebSearchResponse {
+	out := &kiro.MCPWebSearchResponse{
+		Query:        query,
+		TotalResults: len(resp.Results),
+		Results:      make([]kiro.MCPWebSearchResult, 0, len(resp.Results)),
+	}
+	for _, r := range resp.Results {
+		out.Results = append(out.Results, kiro.MCPWebSearchResult{
+			Title:         r.Title,
+			URL:           r.URL,
+			Snippet:       r.Snippet,
+			PublishedDate: parsePageAgeToUnixMilli(r.PageAge),
+		})
+	}
+	return out
+}
+
+// parsePageAgeToUnixMilli best-effort converts a provider-supplied age
+// string into Unix milliseconds. Supports:
+//   - ISO-8601 / RFC3339
+//   - "YYYY-MM-DD"
+//   - empty → 0 (skipped in the UI)
+func parsePageAgeToUnixMilli(s string) int64 {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return 0
+	}
+	for _, layout := range []string{time.RFC3339, "2006-01-02", "2006-01-02T15:04:05Z"} {
+		if t, err := time.Parse(layout, s); err == nil {
+			return t.UTC().UnixMilli()
+		}
+	}
+	return 0
 }

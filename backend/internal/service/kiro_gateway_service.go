@@ -216,6 +216,19 @@ func (s *KiroGatewayService) Forward(
 	requestID := resp.Header.Get("X-Amzn-Requestid")
 	conversationID := resp.Header.Get("X-Amzn-Codewhisperer-Conversation-Id")
 
+	if !parsed.Stream {
+		// --- Non-streaming path: buffer the whole stream, collapse it
+		// into a single Anthropic Messages JSON response body, and send
+		// it back as application/json. Claude Code and several other
+		// clients issue stream=false for certain tool-follow-up turns
+		// (e.g. WebFetch polling). They choke on text/event-stream.
+		return s.forwardNonStream(
+			forwardCtx, c, resp.Body, account, parsed, anthropicReq,
+			profileArn, mapping, requestID, conversationID, upstreamModel,
+			start, token, client,
+		)
+	}
+
 	// Prepare response for Anthropic SSE streaming.
 	c.Writer.Header().Set("Content-Type", "text/event-stream")
 	c.Writer.Header().Set("Cache-Control", "no-cache")
@@ -260,6 +273,7 @@ func (s *KiroGatewayService) Forward(
 		kiroUpstreamHeaders(token),
 		s.mcpResultCache,
 		account.ID,
+		resolveAccountProxyURL(account),
 	)
 	text, err := kiro.DriveEventStreamToAnthropicWithInterceptor(forwardCtx, resp.Body, encoder, interceptor)
 	if err != nil && !errors.Is(err, context.Canceled) {
@@ -545,6 +559,84 @@ func conversationIDFromContext(c *gin.Context) string {
 
 // ensure url is imported (silence tree-shakers during partial builds).
 var _ = url.URL{}
+
+// forwardNonStream collapses the Kiro upstream SSE stream into a single
+// Anthropic-format JSON response. It is invoked when the client requested
+// stream=false — Claude Code uses that mode for certain tool-follow-up
+// turns and reads $.input_tokens / $.content directly from the body.
+func (s *KiroGatewayService) forwardNonStream(
+	ctx context.Context,
+	c *gin.Context,
+	upstream io.Reader,
+	account *Account,
+	parsed *ParsedRequest,
+	anthropicReq *kiro.AnthropicRequest,
+	profileArn string,
+	mapping map[string]string,
+	requestID, conversationID, upstreamModel string,
+	start time.Time,
+	token string,
+	client *http.Client,
+) (*ForwardResult, error) {
+	builder := kiro.NewAnthropicNonStreamBuilder(parsed.Model)
+
+	// Carry over the same input-tokens hint logic the SSE path uses so
+	// the JSON response's usage.input_tokens is never 0.
+	estimatedInput := estimateKiroInputTokens(parsed)
+	if estimatedInput > 0 {
+		builder.SetInputTokensHint(int64(estimatedInput))
+	}
+
+	// Wire up the same web_search interceptor; it only needs an emit
+	// callback and works fine against the non-stream builder because
+	// builder.Emit swallows events into in-memory buffers.
+	interceptor := newKiroWebSearchInterceptor(
+		ctx,
+		client,
+		token,
+		anthropicReq,
+		kiro.BuildOptions{
+			ProfileArn:     profileArn,
+			ModelMapping:   mapping,
+			ConversationID: conversationIDFromContext(c),
+		},
+		kiroUpstreamEndpoint,
+		kiroUpstreamHeaders(token),
+		s.mcpResultCache,
+		account.ID,
+		resolveAccountProxyURL(account),
+	)
+
+	_, err := kiro.DriveEventStreamToSink(ctx, upstream, builder, interceptor)
+	stopReason := "end_turn"
+	if err != nil && !errors.Is(err, context.Canceled) {
+		stopReason = "error"
+	}
+	body, ferr := builder.Finish(stopReason)
+	if ferr != nil {
+		return nil, fmt.Errorf("kiro forward: finalize non-stream body: %w", ferr)
+	}
+	c.Data(http.StatusOK, "application/json", body)
+
+	duration := time.Since(start)
+	inputTokens := int(builder.InputTokens())
+	if inputTokens == 0 {
+		inputTokens = estimateKiroInputTokens(parsed)
+	}
+	return &ForwardResult{
+		RequestID:     kiroFirstNonEmpty(requestID, conversationID),
+		Model:         parsed.Model,
+		UpstreamModel: upstreamModel,
+		Stream:        false,
+		Duration:      duration,
+		Usage: ClaudeUsage{
+			InputTokens:  inputTokens,
+			OutputTokens: int(builder.OutputTokens()),
+		},
+		KiroMeteringCredit:  builder.MeteringCredit(),
+		KiroContextUsagePct: builder.ContextUsagePct(),
+	}, nil
+}
 
 func kiroFirstNonEmpty(a, b string) string {
 	if strings.TrimSpace(a) != "" {
