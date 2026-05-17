@@ -253,6 +253,16 @@ func (s *KiroGatewayService) Forward(
 		encoder.SetInputTokensHint(int64(estimatedInput))
 	}
 
+	// Build the prompt-cache simulator profile. Kiro CodeWhisperer ignores
+	// Anthropic-style cache_control breakpoints, and several Kiro models
+	// never report tokenUsage.cacheReadInputTokens at all, so without this
+	// the client-side cache_control hints from Claude Code / Cline /
+	// Cursor would never light up. Profile is nil for tiny prompts.
+	cacheProfile := kiro.Default().BuildProfile(account.ID, anthropicReq)
+	if cacheProfile != nil {
+		cacheProfile.Lookup()
+	}
+
 	// Install the web_search interceptor: when the Kiro model invokes
 	// `WebSearch` / `web_search`, the interceptor runs the search via
 	// Kiro's /mcp endpoint and then launches a follow-up
@@ -284,6 +294,26 @@ func (s *KiroGatewayService) Forward(
 	if err != nil {
 		stopReason = "error"
 	}
+
+	// Apply the prompt-cache simulator overlay BEFORE Finish() emits the
+	// closing message_delta — that's the frame Anthropic clients read for
+	// final usage. Apply is a no-op when Kiro reported its own cache
+	// numbers (defers to upstream truth). Commit fingerprints only after
+	// a successful end_turn so partial/error streams don't poison the
+	// account cache table.
+	estimatedForCache := int64(encoder.InputTokens())
+	if estimatedForCache == 0 {
+		estimatedForCache = int64(estimateKiroInputTokens(parsed))
+	}
+	var cacheAdj kiro.Adjustment
+	if cacheProfile != nil && err == nil {
+		cacheAdj = cacheProfile.Apply(estimatedForCache, encoder.CacheReadTokens(), encoder.CacheWriteTokens())
+		if cacheAdj.CacheReadInputTokens > 0 || cacheAdj.CacheCreationInputTokens > 0 {
+			encoder.ApplySimulatedCacheTokens(cacheAdj.CacheReadInputTokens, cacheAdj.CacheCreationInputTokens)
+		}
+		cacheProfile.Commit()
+	}
+
 	_ = encoder.Finish(stopReason)
 	flush()
 
@@ -300,6 +330,12 @@ func (s *KiroGatewayService) Forward(
 	if inputTokens == 0 {
 		inputTokens = estimateKiroInputTokens(parsed)
 	}
+	// When the simulator overlaid a cache read, surface the billable
+	// (post-cache) input number to ForwardResult so usage logs match what
+	// the client sees in message_delta.
+	if cacheAdj.CacheReadInputTokens > 0 && cacheAdj.InputTokens > 0 {
+		inputTokens = int(cacheAdj.InputTokens)
+	}
 
 	return &ForwardResult{
 		RequestID:     kiroFirstNonEmpty(requestID, conversationID),
@@ -308,8 +344,10 @@ func (s *KiroGatewayService) Forward(
 		Stream:        parsed.Stream,
 		Duration:      duration,
 		Usage: ClaudeUsage{
-			InputTokens:  inputTokens,
-			OutputTokens: int(encoder.OutputTokens()),
+			InputTokens:              inputTokens,
+			OutputTokens:             int(encoder.OutputTokens()),
+			CacheReadInputTokens:     int(encoder.CacheReadTokens()),
+			CacheCreationInputTokens: int(encoder.CacheWriteTokens()),
 		},
 		KiroMeteringCredit:  encoder.MeteringCredit(),
 		KiroContextUsagePct: encoder.ContextUsagePct(),
@@ -592,6 +630,15 @@ func (s *KiroGatewayService) forwardNonStream(
 		builder.SetInputTokensHint(int64(estimatedInput))
 	}
 
+	// Same prompt-cache simulator hookup as the streaming path. The
+	// non-stream code path is taken for Claude Code's tool-follow-up turns
+	// (WebFetch polling etc.); without this they would never carry
+	// simulated cache_read_input_tokens either.
+	cacheProfile := kiro.Default().BuildProfile(account.ID, anthropicReq)
+	if cacheProfile != nil {
+		cacheProfile.Lookup()
+	}
+
 	// Wire up the same web_search interceptor; it only needs an emit
 	// callback and works fine against the non-stream builder because
 	// builder.Emit swallows events into in-memory buffers.
@@ -617,6 +664,22 @@ func (s *KiroGatewayService) forwardNonStream(
 	if err != nil && !errors.Is(err, context.Canceled) {
 		stopReason = "error"
 	}
+
+	// Apply prompt-cache simulator overlay before Finish() serialises the
+	// final usage block. Mirrors the streaming Forward path.
+	estimatedForCache := int64(builder.InputTokens())
+	if estimatedForCache == 0 {
+		estimatedForCache = int64(estimateKiroInputTokens(parsed))
+	}
+	var cacheAdj kiro.Adjustment
+	if cacheProfile != nil && err == nil {
+		cacheAdj = cacheProfile.Apply(estimatedForCache, builder.CacheReadTokens(), builder.CacheWriteTokens())
+		if cacheAdj.CacheReadInputTokens > 0 || cacheAdj.CacheCreationInputTokens > 0 {
+			builder.ApplySimulatedCacheTokens(cacheAdj.CacheReadInputTokens, cacheAdj.CacheCreationInputTokens)
+		}
+		cacheProfile.Commit()
+	}
+
 	body, ferr := builder.Finish(stopReason)
 	if ferr != nil {
 		return nil, fmt.Errorf("kiro forward: finalize non-stream body: %w", ferr)
@@ -628,6 +691,9 @@ func (s *KiroGatewayService) forwardNonStream(
 	if inputTokens == 0 {
 		inputTokens = estimateKiroInputTokens(parsed)
 	}
+	if cacheAdj.CacheReadInputTokens > 0 && cacheAdj.InputTokens > 0 {
+		inputTokens = int(cacheAdj.InputTokens)
+	}
 	return &ForwardResult{
 		RequestID:     kiroFirstNonEmpty(requestID, conversationID),
 		Model:         parsed.Model,
@@ -635,8 +701,10 @@ func (s *KiroGatewayService) forwardNonStream(
 		Stream:        false,
 		Duration:      duration,
 		Usage: ClaudeUsage{
-			InputTokens:  inputTokens,
-			OutputTokens: int(builder.OutputTokens()),
+			InputTokens:              inputTokens,
+			OutputTokens:             int(builder.OutputTokens()),
+			CacheReadInputTokens:     int(builder.CacheReadTokens()),
+			CacheCreationInputTokens: int(builder.CacheWriteTokens()),
 		},
 		KiroMeteringCredit:  builder.MeteringCredit(),
 		KiroContextUsagePct: builder.ContextUsagePct(),

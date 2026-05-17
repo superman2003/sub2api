@@ -4,6 +4,36 @@ This fork adds **Kiro platform support** (Amazon Q Developer / CodeWhisperer) an
 
 ## New Features
 
+### Kiro Prompt Cache Simulator (port of luohui1/kiro2api PromptCacheTracker)
+
+Kiro CodeWhisperer 原生 prefix cache 只识别自家 `cachePoint` 标记，不解析客户端发的
+`cache_control.ttl`（"5m" / "1h"），且部分 Kiro 模型完全不报
+`tokenUsage.cacheReadInputTokens`，导致 Claude Code / Cline / Cursor 用户精心
+打的 `cache_control` 断点永远不亮。
+
+新增 `KiroPromptCacheTracker`（`backend/internal/pkg/kiro/prompt_cache_tracker.go`）
+在反代侧维护**账号级** `fingerprint -> expires_at` 表，模拟 Anthropic prompt
+caching 行为：
+
+- **上游优先**：Kiro 返回非零 cache 字段时完全让位，绝不双重计数
+- **上游沉默时**：写入 simulator 模拟值，让客户端 `cache_control` 终于有效
+- **5m / 1h 拆分**：`system` / `tools` 段走 1h，`messages` prefix 段走 5m
+- **SHA-256 累积指纹**：canonical JSON（key 排序）保证多轮对话稳定命中
+- **滑动窗口**：命中即刷新过期时间，长会话稳定保温
+- **阈值与封顶**：Opus 4096 / 其他 1024 token，最大 85% 命中比例
+- **账号级容量与 GC**：单账号 200 条目上限，60s 周期清理过期项 + FIFO 淘汰
+- **成功才提交**：仅 `err == nil` 时 `Commit()`，部分流 / 中断不污染表
+- **并发安全**：每账号 bucket 独立 `sync.Mutex`
+
+集成点：`KiroGatewayService.Forward` 流式路径与 `forwardNonStream` 非流式路径
+均在 `Finish()` 之前注入 overlay，最终 `message_delta` / 非流式 JSON 都会
+携带 `cache_read_input_tokens` / `cache_creation_input_tokens`。
+
+- **完全向后兼容**：未携带 `cache_control` 的请求 profile=nil，整个 simulator 旁路
+- **不影响计费**：sub2api 的 Kiro 计费走 credit，simulator 仅影响给客户端展示
+  的 usage 字段
+- **启动即生效**：使用进程级单例 `kiro.Default()`，无需任何配置开关
+
 ### Kiro Platform Integration
 - **Full Kiro account lifecycle**: OAuth (Google social login), AWS Builder ID (OIDC Device Grant), and manual token paste
 - **AWS Builder ID login** (recommended): One-click device authorization flow — no browser callback URL copying needed

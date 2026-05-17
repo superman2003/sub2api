@@ -255,6 +255,13 @@ type AnthropicSSEEncoder struct {
 	toolOrder       []string
 	inputTokens     int64
 	outputTokens    int64
+	// cacheReadTokens / cacheWriteTokens are surfaced in the closing
+	// message_delta usage block when the prompt-cache simulator (or an
+	// upstream that actually reports cache fields) provides them. Naming
+	// mirrors Anthropic: cacheReadTokens -> cache_read_input_tokens,
+	// cacheWriteTokens -> cache_creation_input_tokens.
+	cacheReadTokens  int64
+	cacheWriteTokens int64
 	meteringCredit  float64
 	meteringUnit    string
 	contextUsagePct float64
@@ -298,6 +305,33 @@ func (e *AnthropicSSEEncoder) SetInputTokensHint(n int64) {
 		e.inputTokens = n
 	}
 }
+
+// ApplySimulatedCacheTokens injects the prompt-cache simulator's overlay
+// (read/write counts) so the closing message_delta surfaces
+// cache_read_input_tokens / cache_creation_input_tokens to clients even
+// when Kiro upstream stayed silent. Caller must only invoke this after
+// the upstream stream completed; the encoder will skip the overlay if
+// upstream-reported values are already present (no double counting).
+func (e *AnthropicSSEEncoder) ApplySimulatedCacheTokens(read, write int64) {
+	if e == nil {
+		return
+	}
+	if e.cacheReadTokens > 0 || e.cacheWriteTokens > 0 {
+		return
+	}
+	if read > 0 {
+		e.cacheReadTokens = read
+	}
+	if write > 0 {
+		e.cacheWriteTokens = write
+	}
+}
+
+// CacheReadTokens returns the simulated/reported cache_read_input_tokens.
+func (e *AnthropicSSEEncoder) CacheReadTokens() int64 { return e.cacheReadTokens }
+
+// CacheWriteTokens returns the simulated/reported cache_creation_input_tokens.
+func (e *AnthropicSSEEncoder) CacheWriteTokens() int64 { return e.cacheWriteTokens }
 
 func (e *AnthropicSSEEncoder) write(event string, payload any) error {
 	body, err := json.Marshal(payload)
@@ -808,16 +842,23 @@ func (e *AnthropicSSEEncoder) Finish(stopReason string) error {
 	if stopReason == "" {
 		stopReason = "end_turn"
 	}
+	finalUsage := map[string]any{
+		"input_tokens":  e.inputTokens,
+		"output_tokens": e.outputTokens,
+	}
+	if e.cacheReadTokens > 0 {
+		finalUsage["cache_read_input_tokens"] = e.cacheReadTokens
+	}
+	if e.cacheWriteTokens > 0 {
+		finalUsage["cache_creation_input_tokens"] = e.cacheWriteTokens
+	}
 	_ = e.write("message_delta", map[string]any{
 		"type": "message_delta",
 		"delta": map[string]any{
 			"stop_reason":   stopReason,
 			"stop_sequence": nil,
 		},
-		"usage": map[string]any{
-			"input_tokens":  e.inputTokens,
-			"output_tokens": e.outputTokens,
-		},
+		"usage": finalUsage,
 	})
 	return e.write("message_stop", map[string]any{
 		"type": "message_stop",
@@ -1245,6 +1286,11 @@ type AnthropicNonStreamBuilder struct {
 
 	inputTokens    int64
 	outputTokens   int64
+	// cacheReadTokens / cacheWriteTokens mirror the streaming encoder so
+	// non-stream responses end up with the same usage shape as the SSE
+	// path when the prompt-cache simulator is active.
+	cacheReadTokens  int64
+	cacheWriteTokens int64
 	meteringCredit float64
 	meteringUnit   string
 	contextUsage   float64
@@ -1284,6 +1330,29 @@ func (b *AnthropicNonStreamBuilder) SetInputTokensHint(n int64) {
 		b.inputTokens = n
 	}
 }
+
+// ApplySimulatedCacheTokens overlays the prompt-cache simulator's cache
+// read/write counts on the final non-stream JSON usage. Mirrors the SSE
+// encoder helper of the same name; defers to whatever Kiro upstream
+// reported (no double counting).
+func (b *AnthropicNonStreamBuilder) ApplySimulatedCacheTokens(read, write int64) {
+	if b == nil {
+		return
+	}
+	if b.cacheReadTokens > 0 || b.cacheWriteTokens > 0 {
+		return
+	}
+	if read > 0 {
+		b.cacheReadTokens = read
+	}
+	if write > 0 {
+		b.cacheWriteTokens = write
+	}
+}
+
+// CacheReadTokens / CacheWriteTokens expose simulated/reported cache tokens.
+func (b *AnthropicNonStreamBuilder) CacheReadTokens() int64  { return b.cacheReadTokens }
+func (b *AnthropicNonStreamBuilder) CacheWriteTokens() int64 { return b.cacheWriteTokens }
 
 // Start is a no-op for the builder; retained so the interface matches
 // AnthropicSSEEncoder and the driver code can call it unconditionally.
@@ -1424,6 +1493,16 @@ func (b *AnthropicNonStreamBuilder) Finish(stopReason string) ([]byte, error) {
 		}
 	}
 
+	usage := map[string]any{
+		"input_tokens":  b.inputTokens,
+		"output_tokens": b.outputTokens,
+	}
+	if b.cacheReadTokens > 0 {
+		usage["cache_read_input_tokens"] = b.cacheReadTokens
+	}
+	if b.cacheWriteTokens > 0 {
+		usage["cache_creation_input_tokens"] = b.cacheWriteTokens
+	}
 	msg := map[string]any{
 		"id":            b.messageID,
 		"type":          "message",
@@ -1432,10 +1511,7 @@ func (b *AnthropicNonStreamBuilder) Finish(stopReason string) ([]byte, error) {
 		"content":       content,
 		"stop_reason":   stopReason,
 		"stop_sequence": nil,
-		"usage": map[string]any{
-			"input_tokens":  b.inputTokens,
-			"output_tokens": b.outputTokens,
-		},
+		"usage":         usage,
 	}
 	return json.Marshal(msg)
 }
